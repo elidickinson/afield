@@ -1,0 +1,69 @@
+// The wire protocol, server side. `src/ttyd.js` is the client's half of this.
+// Both ends are ours; the frame shape is ttyd's.
+
+// client -> server
+export const INPUT = 0x30        // '0'
+export const RESIZE = 0x31       // '1'
+
+// server -> client
+export const OUTPUT = 0x30       // '0'
+export const SET_TITLE = 0x31    // '1'
+export const SET_SIZE = 0x33     // '3'  the grid the PTY actually has
+export const FOOTER = 0x34       // '4'  the status strip's state, as the afield-footer extension reported it
+export const PROCESS = 0x35      // '5'  this PTY's place: on admission, and again at every conversation change
+
+// Lines of history a snapshot carries unless the server was told otherwise.
+// The page tells the client's VT core to keep the same number.
+export const DEFAULT_SCROLLBACK = 10_000
+
+/**
+ * A size off the wire, from either the handshake or a RESIZE frame.
+ *
+ * The handshake is a bare JSON object with no command byte and must be the first
+ * message on the socket; a RESIZE is the same payload behind a prefix. Both
+ * reach the PTY, so both get the same scrutiny. Returns null for anything
+ * unparseable or unreasonable, which closes that viewer rather than the server.
+ */
+const decodeDimensions = value => {
+  const { columns, rows } = value
+  if (!Number.isInteger(columns) || !Number.isInteger(rows)) return null
+  // The upper bound is not theatre: the grid is allocated server-side, in the
+  // mirror as well as the PTY.
+  if (columns < 1 || rows < 1 || columns > 1000 || rows > 1000) return null
+  return { cols: columns, rows }
+}
+
+export const decodeHandshake = buf => {
+  try {
+    const value = JSON.parse(buf.toString())
+    const size = decodeDimensions(value)
+    return size && { ...size, client: value.client }
+  } catch {
+    return null
+  }
+}
+
+export const decodeSize = buf => {
+  try {
+    return decodeDimensions(JSON.parse(buf.toString()))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The status strip's state, as the extension sends it over its own socket. An
+ * empty id is a state of its own -- pi has no model to name -- and anything
+ * that is neither that nor a model name is dropped rather than relayed: this
+ * reaches a phone that has nothing to draw from it. Subagents are running
+ * only when the report says so in as many words.
+ */
+export const decodeFooter = buf => {
+  try {
+    const { provider, id, thinking, subagents } = JSON.parse(buf.toString())
+    if (typeof provider !== 'string' || typeof id !== 'string') return null
+    return { provider, id, thinking: typeof thinking === 'string' ? thinking : null, subagents: subagents === true }
+  } catch {
+    return null
+  }
+}

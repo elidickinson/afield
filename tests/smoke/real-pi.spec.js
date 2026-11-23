@@ -1,0 +1,199 @@
+// Against real pi, driven by a deterministic test extension (slash commands
+// render fixture output without an agent turn, so no tokens). Each test gets a
+// fresh server and pi, so every fixture render starts from an empty scrollback.
+import { test, expect } from './helpers.js'
+
+// The widest run of box-drawing dashes on screen — pi's horizontal rules span
+// the full width, so this is a cheap read of the columns pi thinks it has.
+const ruleWidth = page => page.evaluate(() =>
+  Math.max(0, ...[...document.querySelectorAll('#screen .term-row')]
+    .map(r => (r.innerText.match(/─+/g) ?? ['']).reduce((a, b) => (b.length > a.length ? b : a), '').length)))
+
+const setGrid = async (page, label, cols) => {
+  await page.getByRole('button', { name: 'menu' }).tap()
+  await page.getByRole('button', { name: label }).tap()
+  await page.getByRole('button', { name: 'Done' }).tap()
+  await expect.poll(() => ruleWidth(page)).toBe(cols)
+}
+
+// Every line the core holds, oldest first: the scrollback, then the live
+// screen unless only the saved history is asked for. Read from the core, not
+// the DOM: the renderer draws only a window of scrollback, so on a transcript
+// longer than the window a line near the top is held by the client but never
+// rendered.
+const coreLines = (page, savedOnly = false) => page.evaluate(savedOnly => {
+  const t = window.afield?.term?.bridge
+  if (!t) return []
+  const row = (get, y) => Array.from({ length: t.getCols() }, (_, x) => String.fromCodePoint(get.call(t, y, x).char || 32)).join('')
+  const lines = []
+  // The scrollback indexes newest-to-oldest, so walk it backwards.
+  for (let y = t.getScrollbackCount() - 1; y >= 0; y--) lines.push(row(t.getScrollbackCell, y))
+  if (!savedOnly) for (let y = 0; y < t.getRows(); y++) lines.push(row(t.getCell, y))
+  return lines
+}, savedOnly)
+
+const coreHasText = async (page, text) => (await coreLines(page)).some(line => line.includes(text))
+
+// The extension's READY marker is emitted once, at pi startup. The page is
+// ready when the client has connected and the server confirmed the grid — the
+// same readiness the e2e helpers use.
+const pageReady = async page => {
+  await page.goto('/')
+  await expect(page.locator('#screen .term-row').first()).toBeVisible({ timeout: 60_000 })
+  await expect.poll(() => page.evaluate(() => Boolean(window.afield?.term?.bridge))).toBe(true)
+  // The extension emits this once at pi startup, so it is the honest
+  // "extension loaded and the TUI is emitting" signal for a fresh pi.
+  await expect.poll(() => coreHasText(page, 'AFIELD_EXTENSION_READY')).toBe(true)
+  await expect.poll(() => page.evaluate(() =>
+    window.afield.state.cols === window.afield.state.wanted.cols &&
+    window.afield.state.rows === window.afield.state.wanted.rows)).toBe(true)
+}
+
+// The fixture ids in the order they appear. Raw, not deduped: a duplicated or
+// repeated render must fail this against allIds, not disappear into a set.
+const fixtureIds = async page => (await coreLines(page)).flatMap(line => {
+  const m = line.match(/AFIELD-LINE-(\d{3})/)
+  return m ? [Number(m[1])] : []
+})
+const allIds = Array.from({ length: 100 }, (_, i) => i)
+
+// Has the resize's repaint landed in the core? At 120 cols each fixture line
+// fits one row, END and all — so the marker line being stored unwrapped means
+// grid and content moved together. Read from the core, not the DOM: a reader
+// parked mid-history has neither the turn rules nor the tail in the rendered
+// window, and the pre-repaint layout is exactly what a broken re-send leaves
+// in its place.
+const repaintLanded = async page =>
+  (await coreLines(page, true)).find(line => line.includes('AFIELD-LINE-000 '))?.includes('END-000') ?? false
+
+const typeFixture = async page => {
+  // Real keydown dispatch, not value injection: wterm's hidden textarea turns
+  // Enter on keydown into \r. Slow the typing: pi's slash palette opens on `/`
+  // and its input handler switches to palette mode asynchronously, so chars in
+  // the same burst as `/` get echoed into the line but never feed the palette
+  // filter, and Enter dismisses the unfiltered palette — pi eats the command.
+  // At 50ms a keystroke the palette is installed before the second one lands.
+  const ta = page.locator('#screen textarea')
+  await ta.focus()
+  await page.keyboard.type('/afield-fixture', { delay: 50 })
+  await page.keyboard.press('Enter')
+}
+
+// A full marker sweep: the trailing done line is present on screen.
+const fixtureComplete = page => page.evaluate(() =>
+  document.getElementById('screen')?.innerText.includes('AFIELD_FIXTURE_DONE') ?? false)
+
+test('real pi renders and reflows across the grid presets', async ({ page }) => {
+  await pageReady(page)
+
+  // A transcript on screen, then move it through every preset. History order
+  // must survive each reflow — the exact class fake-pi masked.
+  await typeFixture(page)
+  await expect.poll(() => fixtureComplete(page)).toBe(true)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+
+  await setGrid(page, '120×40', 120)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+  await setGrid(page, '160×50', 160)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+  await setGrid(page, '50×30', 50)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+})
+
+test('pi keeps a real scrollback — nothing in the stack imposes an alternate screen', async ({ page }) => {
+  await pageReady(page)
+
+  const alt = await page.evaluate(() => window.afield.term.bridge.usingAltScreen())
+  expect(alt).toBe(false)
+
+  // A tall transcript, then a shrink. Content goes into scrollback rather than
+  // being destroyed, and never through an alternate screen.
+  await typeFixture(page)
+  await expect.poll(() => fixtureComplete(page)).toBe(true)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+  await page.getByRole('button', { name: 'menu' }).tap()
+  await page.getByRole('button', { name: '50×30' }).tap()
+  await page.getByRole('button', { name: 'Done' }).tap()
+  await expect.poll(() => ruleWidth(page)).toBe(50)
+  // The newest fixture line is still on screen; the rest is history, in order.
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+  const stillAlt = await page.evaluate(() => window.afield.term.bridge.usingAltScreen())
+  expect(stillAlt).toBe(false)
+})
+
+test('reconnecting to a running session keeps the whole transcript, in order', async ({ page }) => {
+  // The server keeps the screen and scrollback, so a fresh page gets them as a
+  // snapshot without pi being asked to repaint. This is the exact path
+  // fake-pi masked: history must survive a resize AND a reconnect, in order.
+  await pageReady(page)
+
+  await typeFixture(page)
+  await expect.poll(() => fixtureComplete(page)).toBe(true)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+
+  // Shrink the grid — the operation that used to scramble history.
+  await page.getByRole('button', { name: 'menu' }).tap()
+  await page.getByRole('button', { name: '50×30' }).tap()
+  await page.getByRole('button', { name: 'Done' }).tap()
+  await expect.poll(() => ruleWidth(page)).toBe(50)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+
+  // Lose the page, come back. A fresh viewer must get the same ordered history.
+  await page.reload()
+  await pageReady(page)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+  await expect.poll(() => page.evaluate(() => window.afield.term.bridge.getScrollbackCount()))
+    .toBeGreaterThan(0)
+})
+
+// How far up the history the view is, as a share of the whole — the same
+// measure the client itself uses to survive a reflow.
+const readingShare = page => page.evaluate(() => {
+  const el = document.getElementById('screen')
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) / el.scrollHeight
+})
+
+test('a resize does not dump a reader at the live edge', async ({ page }) => {
+  // A grid change replaces the whole rendered buffer, and the DOM collapses to
+  // one screen before the resize's snapshot lands. If the reading position is
+  // not carried across that gap, the browser resets scrollTop to the top of
+  // the shrunk buffer and the app's own bottom-pinning then reads that as
+  // "already at the bottom" and leaves it there — every resize dumps whoever
+  // is scrolled back into history at the live edge.
+  await pageReady(page)
+  await typeFixture(page)
+  await expect.poll(() => fixtureComplete(page)).toBe(true)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+
+  // Somewhere in the middle of history — not the top, not the bottom — so a
+  // regression that clamps to either extreme is distinguishable from a
+  // genuinely preserved position, not just "technically not at the bottom".
+  await page.evaluate(() => {
+    const el = document.getElementById('screen')
+    el.scrollTop = el.scrollHeight * 0.4
+  })
+  const before = await readingShare(page)
+  expect(before).toBeGreaterThan(0.3)
+
+  await page.getByRole('button', { name: 'menu' }).tap()
+  await page.getByRole('button', { name: '120×40' }).tap()
+  await page.getByRole('button', { name: 'Done' }).tap()
+  await expect.poll(() => repaintLanded(page)).toBe(true)
+
+  // The reader's relative position survives the reflow, within the rounding a
+  // coarser row grid introduces. A one-sided "not less than" bound would still
+  // pass a regression that clamps to the very top (share → 1), which is
+  // exactly the failure this test exists to catch, so it checks both sides.
+  await expect.poll(async () => Math.abs((await readingShare(page)) - before), { timeout: 2_000 })
+    .toBeLessThan(0.1)
+  await expect.poll(() => fixtureIds(page)).toEqual(allIds)
+})
+
+test('the status strip carries the captured stats', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'standalone', { value: true, configurable: true })
+  })
+  await pageReady(page)
+  await expect(page.locator('#strip')).toBeVisible({ timeout: 15_000 })
+  expect((await page.locator('#strip').innerText()).length).toBeGreaterThan(0)
+})

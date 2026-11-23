@@ -1,0 +1,143 @@
+#!/usr/bin/env node
+// A deterministic content generator with sync markers, NOT a pi emulator. It
+// may be simpler than pi, but it must never produce a shape pi cannot produce:
+// pi draws its input box inline after the transcript (never pinned to the last
+// row of the grid) and redraws promptly on SIGWINCH. Do not add fidelity the
+// specs do not consume — a closer lookalike only adds false confidence.
+import { connect } from 'node:net'
+
+const home = process.env.HOME
+const where = home && process.cwd().startsWith(home)
+  ? `~${process.cwd().slice(home.length)}`
+  : process.cwd()
+const history = ['fake-pi ready — type and press enter']
+let buf = ''
+
+const out = s => process.stdout.write(s)
+// Read fresh, never process.stdout.columns/rows: node refreshes those from its
+// own SIGWINCH listener, which on macOS can run before the new winsize is
+// readable on the slave, leaving them a whole resize behind.
+const size = () => process.stdout.getWindowSize()
+let drawn = ''
+
+const draw = () => {
+  const [cols, rows] = size()
+  drawn = `${cols}x${rows}`
+  out('\x1b[H\x1b[2J')
+  // Transcript, then the input box and status line inline after it: a short
+  // transcript leaves the foot of the grid empty.
+  const shown = history.slice(-(rows - 4))
+  for (const line of shown) out(`${line}\r\n`)
+  const bar = '─'.repeat(cols - 2)
+  out(`┌${bar}┐\r\n`)
+  out(`│ \x1b[36m>\x1b[0m ${buf.padEnd(cols - 5)}│\r\n`)
+  out(`└${bar}┘\r\n`)
+  out(`\x1b[2m ${where}  ${cols}x${rows}\x1b[0m`)
+  // Park the cursor inside the box.
+  out(`\x1b[${shown.length + 2};${buf.length + 5}H`)
+}
+
+const submit = () => {
+  const line = buf
+  buf = ''
+  if (line === '/quit') {
+    out('\x1b[2J\x1b[H')
+    process.exit(0)
+  } else if (line.startsWith('/lines')) {
+    // Scroll real lines off the top so the client accrues scrollback. Each
+    // line lands on the bottom row and the newline scrolls the screen; the
+    // redraw clears the screen but not the scrollback (no \e[3J), so they
+    // survive above the fold. A count past the server's --scrollback saturates the client's ring,
+    // where history stops appending and starts rotating.
+    const n = parseInt(line.slice(6), 10) || 80
+    out(`\x1b[${size()[1]};1H`)
+    for (let i = 0; i < n; i++) out(`scrollback line ${i}\r\n`)
+  } else if (line.startsWith('/turn')) {
+    // An agent run of the given milliseconds, as pi reports one: working, then done.
+    status('working')
+    setTimeout(() => status('done'), parseInt(line.slice(5), 10) || 500)
+  } else if (line.startsWith('/subagents')) {
+    // Background subagents running for the given milliseconds, as the
+    // afield-footer extension reports them.
+    report(true)
+    setTimeout(() => report(false), parseInt(line.slice(10), 10) || 500)
+  } else if (line.startsWith('/block')) {
+    // A run that stops on a dialog: working, blocked from the given
+    // milliseconds on, and working again as long after that.
+    const ms = parseInt(line.slice(6), 10) || 500
+    status('working')
+    setTimeout(() => status('blocked'), ms)
+    setTimeout(() => status('working'), 2 * ms)
+  } else if (line.startsWith('/ask')) {
+    // A dialog on an idle pi, opening after the given milliseconds.
+    setTimeout(() => status('blocked'), parseInt(line.slice(4), 10) || 500)
+  } else if (line.startsWith('/stream')) {
+    // A line every 100ms: the shape of pi writing a long answer. Each line is
+    // a real newline on the bottom row, so the screen genuinely scrolls and
+    // the top of the transcript lands in the client's scrollback — that
+    // rotation under a reader is the point. draw() then repaints the tail and
+    // the input box, as pi does after appending.
+    const n = parseInt(line.slice(7), 10) || 40
+    let i = 0
+    const timer = setInterval(() => {
+      history.push(`stream line ${i}`)
+      out(`\x1b[${size()[1]};1Hstream line ${i}\r\n`)
+      draw()
+      if (++i >= n) clearInterval(timer)
+    }, 100)
+  } else {
+    history.push(`> ${line}`, `ok: ${line.length} chars`)
+  }
+}
+
+// pi's program status (OSC 7501), which it writes only when told to: the
+// suites see it only if afield sets PI_PROGRAM_STATUS. pi reports idle as
+// its UI starts.
+function status(state) {
+  if (process.env.PI_PROGRAM_STATUS === '1') out(`\x1b]7501;state=${state}:app=pi\x1b\\`)
+}
+status('idle')
+
+// The report the afield-footer pi extension sends the real program's server, so
+// the suites can see the strip and tab markers without pi. One connection
+// carrying one object and closing behind it, as the extension does.
+function report(subagents) {
+  if (!process.env.AFIELD_FOOTER) return
+  const sock = connect(process.env.AFIELD_FOOTER)
+  sock.on('error', () => {})
+  sock.end(`${JSON.stringify({ provider: 'fake', id: 'pi', thinking: 'max', subagents })}\n`)
+}
+report(false)
+
+let esc = 0   // 0 none, 1 after ESC, 2 inside a CSI/SS3 sequence
+process.stdin.setRawMode(true)
+process.stdin.on('data', data => {
+  for (const ch of data.toString()) {
+    // Escape sequences vary in length — \e[A is three bytes, \e[1;5C is six —
+    // so swallow up to the final byte instead of counting a fixed number.
+    if (esc === 1) { esc = ch === '[' || ch === 'O' ? 2 : 0; continue }
+    if (esc === 2) { if (/[A-Za-z@~]/.test(ch)) esc = 0; continue }
+    if (ch === '\r' || ch === '\n') submit()
+    else if (ch === '\x7f') buf = buf.slice(0, -1)
+    else if (ch === '\x1b') esc = 1
+    else buf += ch
+  }
+  draw()
+})
+// The PTY master closing is how the parent's death arrives here.
+process.stdin.on('end', () => process.exit(0))
+// macOS delivers SIGWINCH a beat before the new winsize is readable on the
+// slave, so drawing straight from the handler paints the old grid. Wait for
+// the size to actually change (sub-millisecond); the deadline covers a resize
+// to the size already drawn.
+process.on('SIGWINCH', () => {
+  const deadline = Date.now() + 200
+  const tick = () => {
+    const [cols, rows] = size()
+    if (`${cols}x${rows}` !== drawn || Date.now() > deadline) draw()
+    else setImmediate(tick)
+  }
+  tick()
+})
+
+draw()

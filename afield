@@ -1,0 +1,248 @@
+#!/bin/bash
+# The entry point. Everything here runs in the foreground and owns what it
+# starts. The server holds every session it has been asked to join, in the
+# background, until it is stopped: ending the server (Ctrl-C here) ends all
+# of them at once, but nothing in front of it does.
+set -euo pipefail
+
+# Resolve through symlinks so ~/bin/afield -> repo/afield, or npm's
+# global bin link, still finds server/.
+self=$0
+while [[ -L "$self" ]]; do
+  self_dir=$(cd -P "$(dirname "$self")" && pwd)
+  self=$(readlink "$self")
+  [[ "$self" == /* ]] || self=$self_dir/$self
+done
+root=$(cd -P "$(dirname "$self")" && pwd)
+# The folder the user ran this in, before the dispatch below cd's into the
+# checkout: `new` starts a session there, not here.
+caller_cwd=$PWD
+cd "$root" || { echo "afield: cannot enter $root" >&2; exit 1; }
+[[ -f server/cli.js ]] || { echo "afield: $root does not look like the afield checkout" >&2; exit 1; }
+
+port="${AFIELD_PORT:-7681}"
+# Empty means the server's own default; the pool size is decided there.
+cap=""
+bind="${AFIELD_BIND:-127.0.0.1}"
+# The one hostname a proxy in front of this may present. Only needed when you
+# reach it by name rather than by address; see --hostname in the usage.
+hostname="${AFIELD_HOSTNAME:-}"
+theme="${AFIELD_THEME:-dark}"
+# Empty means the server's own default.
+scrollback=""
+newdir="${AFIELD_NEW_DIR:-}"
+no_sign_in=""
+# Set by any option only serve reads, so a bare call that names one serves.
+serve_option=""
+
+default_program=(pi)
+no_pi=""
+# What `new` starts: empty for pi, or shell.
+kind=""
+
+usage() {
+  cat <<'USAGE'
+Usage: afield [command] [options] [program...]
+
+  sessions       list sessions on the server (the default when one is running)
+  end [fragment|n] end a running session
+  serve          serve the terminal (the default when none is running)
+  new [--shell]  start a fresh pi, or a terminal, in this folder and attach to it
+  attach [fragment|n] attach this terminal to a running server
+  attach -       reattach to the last session attached from this machine
+  resume         alias for attach
+  set-key        pick your own sign-in key instead of the one made for you
+
+Options
+
+  --lan          short for --bind 0.0.0.0
+  --bind ADDR    listen on one address (default 127.0.0.1, or $AFIELD_BIND)
+  --port N       default 7681, or $AFIELD_PORT
+  --cap N        how many sessions run at once (default 10); at the limit,
+                 starting or joining asks which running session to end
+  --hostname NAME the name a proxy in front of this presents, e.g. the
+                 Cloudflare or tailnet hostname (or $AFIELD_HOSTNAME)
+  --theme NAME   dark (default) or light; the menu can also switch per-device
+  --scrollback N lines of history kept, and re-sent on reconnect (default 10000)
+  --new-dir DIR  where the phone's "new session" starts (default: this folder,
+                 or $AFIELD_NEW_DIR)
+  --no-pi        serve: offer only terminals, for a machine without pi
+  --shell        new: start a terminal running your $SHELL instead of pi
+  --no-sign-in   serve: let every connection in without the sign-in key
+  --yes          skip the confirmation when ending a session
+
+Loopback is the default, for this machine and for a tunnel or proxy running on
+it. Use --lan to reach it from a phone on the same wifi.
+
+Joining a session spawns it in the background if it is not already running,
+and leaves it running when you look away — the phone, a browser tab and any
+number of `attach`ed terminals can each be looking at a different one at the
+same time, the way running pi a few times in different terminals would be.
+Whichever session a viewer is looking at, the narrowest viewer of that one
+decides its size, because this is meant to be read on a phone.
+`attach [name-or-path|n]` joins a server that is already running; it does not
+start one, and prompts if more than one session matches. `new` starts a fresh
+session in the folder it was run from and attaches to it at once. `attach -` rejoins the
+last session attached from this machine. `sessions` lists the
+running ones, and `end [fragment|n]` stops a running session after confirmation;
+`--yes` skips that confirmation. Exiting the program in a session also ends it,
+and Ctrl-C in the terminal serving all of them ends every session at once.
+
+The menu offers every session pi has a transcript for, newest first, whether
+or not it is currently running, and terminals that run your $SHELL.
+
+Every browser signs in once with a key, kept in ~/.config/afield/key and
+made on first use unless you pick one with set-key. serve prints it with a QR
+code that signs a phone in, and the commands here read it from that file.
+Capitals, spaces and dashes in it don't count. Nothing limits guesses, so a key
+you pick should be long. Delete the file or set a new key, then restart serve,
+to sign every device out.
+
+A page on any site you visit can open a WebSocket to this server, so sockets
+are refused unless their Origin matches the address they connected to. Reaching
+it by address needs nothing; reaching it by name needs that name in --hostname.
+USAGE
+}
+
+die() { echo "afield: $*" >&2; exit 1; }
+usage_error() { echo "afield: $*" >&2; exit 2; }
+
+cmd=""
+yes=0
+end_match=""
+attach_previous=0
+
+# Options can come either side of the command; serve's first non-option is the
+# program, while end captures one fragment and can still read options after it.
+take_options() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lan|--cap|--hostname|--theme|--scrollback|--new-dir|--no-pi|--no-sign-in) serve_option=1 ;;
+    esac
+    case "$1" in
+      --lan) bind=0.0.0.0; shift ;;
+      --bind) [[ $# -ge 2 ]] || usage_error "--bind needs a value"; bind=$2; shift 2 ;;
+      --port) [[ $# -ge 2 ]] || usage_error "--port needs a value"; port=$2; shift 2 ;;
+      --cap) [[ $# -ge 2 ]] || usage_error "--cap needs a value"; cap=$2; shift 2 ;;
+      --hostname) [[ $# -ge 2 ]] || usage_error "--hostname needs a value"; hostname=$2; shift 2 ;;
+      --theme) [[ $# -ge 2 ]] || usage_error "--theme needs a value"; theme=$2; shift 2 ;;
+      --scrollback) [[ $# -ge 2 ]] || usage_error "--scrollback needs a value"; scrollback=$2; shift 2 ;;
+      --new-dir) [[ $# -ge 2 ]] || usage_error "--new-dir needs a value"; newdir=$2; shift 2 ;;
+      --no-pi) no_pi=1; shift ;;
+      --shell) kind=shell; shift ;;
+      --no-sign-in) no_sign_in=1; shift ;;
+      --yes) yes=1; shift ;;
+      -h|--help|help) usage; exit 0 ;;
+      --) shift; break ;;
+      -)
+        [[ "$cmd" == attach && "$attach_previous" -eq 0 ]] || usage_error "unknown option $1"
+        attach_previous=1; shift ;;
+      -*) usage_error "unknown option $1" ;;
+      serve|sessions|end|new|attach|resume|set-key)
+        [[ -z "$cmd" ]] || break        # a second one is the program's business
+        cmd=$1
+        [[ "$cmd" != resume ]] || cmd=attach
+        shift ;;
+      *)
+        if [[ "$cmd" == end && -z "$end_match" ]]; then
+          end_match=$1; shift
+        else
+          break
+        fi ;;
+    esac
+  done
+  REST=("$@")
+}
+
+REST=()
+take_options "$@"
+set -- ${REST[@]+"${REST[@]}"}
+if [[ -z "$cmd" && $# -gt 0 ]]; then
+  usage_error "unknown command: $1"
+fi
+# Bare: list what a running server has, or become the server when none answers
+# or an option only serve reads was given.
+if [[ -z "$cmd" ]]; then
+  if [[ -z "$serve_option" ]] && (: <>"/dev/tcp/$bind/$port") 2>/dev/null; then cmd=sessions; else cmd=serve; fi
+fi
+[[ -z "$no_pi" || "$cmd" == serve ]] || usage_error "--no-pi is for serve"
+[[ -z "$kind" || "$cmd" == new ]] || usage_error "--shell is for new"
+
+# Follows --bind: node resolves `localhost` to ::1 on a machine that prefers
+# IPv6, so a URL pinned to 127.0.0.1 would never find a server that bound by
+# name. An IPv6 literal needs brackets to go in one.
+case "$bind" in *:*) host="[$bind]" ;; *) host=$bind ;; esac
+
+case "$cmd" in
+  serve)
+    if [[ -n "$no_pi" ]]; then
+      [[ $# -eq 0 ]] || usage_error "--no-pi takes no program"
+    else
+      [[ $# -gt 0 ]] || set -- "${default_program[@]}"
+      # A pi that cannot run is said here rather than on the phone when the
+      # first session fails to start. A bare name is a PATH lookup; a relative
+      # path is read from where you ran this, not the install folder this
+      # script cd'd into.
+      case "$1" in
+        */*)
+          [[ "$1" == /* ]] || set -- "$caller_cwd/$1" "${@:2}"
+          [[ -f "$1" && -x "$1" ]] || die "$1 is not an executable file" ;;
+        *) command -v "$1" >/dev/null ||
+             die "$1 is not on PATH$([[ "$1" == pi ]] && echo ' -- install it: npm install -g @earendil-works/pi-coding-agent, or serve --no-pi for terminals only')" ;;
+      esac
+    fi
+
+    # New sessions start where serve was run, and a relative --new-dir is read
+    # from there too, not from the install folder this script cd'd into. A
+    # quoted or environment ~ reaches here unexpanded.
+    newdir=${newdir:-$caller_cwd}
+    [[ "$newdir" == "~" || "$newdir" == "~/"* ]] && newdir=$HOME${newdir#\~}
+    [[ "$newdir" == /* ]] || newdir=$caller_cwd/$newdir
+
+    # Empty unless a name was given, so the flag is absent rather than blank.
+    host_args=()
+    [[ -n "$hostname" ]] && host_args=(--hostname "$hostname")
+    server_args=(--port "$port" ${cap:+--cap "$cap"} --bind "$bind" --theme "$theme"
+      ${scrollback:+--scrollback "$scrollback"} --new-dir "$newdir"
+      ${no_pi:+--no-pi} ${no_sign_in:+--no-sign-in} ${host_args[@]+"${host_args[@]}"})
+
+    exec node server/cli.js "${server_args[@]}" -- "$@"
+    ;;
+  sessions)
+    [[ $# -eq 0 ]] || usage_error "sessions takes no arguments"
+    exec env node -e "import('./server/control.js').then(m => m.sessions('ws://$host:$port'))"
+    ;;
+  end)
+    [[ $# -eq 0 ]] || usage_error "end takes at most one session fragment or number"
+    exec env AFIELD_END_MATCH="$end_match" AFIELD_YES="$yes" node -e \
+      "import('./server/control.js').then(m => m.end('ws://$host:$port', { match: process.env.AFIELD_END_MATCH || undefined, yes: process.env.AFIELD_YES === '1' }))"
+    ;;
+  attach)
+    if [[ "$attach_previous" -eq 1 ]]; then
+      [[ $# -eq 0 ]] || usage_error "attach - takes no session name"
+      exec env node -e \
+        "import('./server/attach.js').then(m => m.attach({ url: 'ws://$host:$port/ws', previous: true }))"
+    fi
+    [[ $# -le 1 ]] || usage_error "attach takes at most one session fragment or number"
+    # An optional name or path fragment picks which of the server's sessions to
+    # join, the same way the phone's own menu lists them; bare `attach` prompts
+    # when more than one matches. Passed through the environment, not baked
+    # into the -e source below, since it is arbitrary text you typed.
+    exec env AFIELD_ATTACH_MATCH="${1:-}" node -e \
+      "import('./server/attach.js').then(m => m.attach({ url: 'ws://$host:$port/ws', match: process.env.AFIELD_ATTACH_MATCH || undefined }))"
+    ;;
+  new)
+    [[ $# -eq 0 ]] || usage_error "new takes no arguments"
+    exec env AFIELD_NEW_CWD="$caller_cwd" node -e \
+      "import('./server/control.js').then(async m => { const started = await m.start('ws://$host:$port', { cwd: process.env.AFIELD_NEW_CWD, kind: '$kind' || undefined }); if (started) { const { attach } = await import('./server/attach.js'); await attach({ url: started.wsUrl, session: started.processId }) } })"
+    ;;
+  set-key)
+    [[ $# -eq 0 ]] || usage_error "set-key takes no arguments"
+    read -rsp "New sign-in key (not shown): " new_key || true
+    echo
+    [[ -n "${new_key//[[:space:]-]/}" ]] || die "the key cannot be empty"
+    key_file="${XDG_CONFIG_HOME:-$HOME/.config}/afield/key"
+    (umask 077 && mkdir -p "${key_file%/*}" && printf '%s\n' "$new_key" > "$key_file")
+    echo "Saved in $key_file. Restart serve to use it; that signs every device out."
+    ;;
+esac

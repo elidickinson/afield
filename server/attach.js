@@ -1,0 +1,280 @@
+// `afield attach`: a viewer like any other, in a real terminal.
+//
+// It speaks the same protocol as the phone, so the desktop is not a special
+// case and cannot resize the PTY behind the server's back. What it has to do
+// that a browser gets for free is act like a terminal: raw mode restored
+// whatever happens, SIGWINCH forwarded, and Ctrl-C and Ctrl-Z passed through to
+// the far side rather than acted on here.
+import { writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { WebSocket } from 'ws'
+import { keyHeaders, keyPath } from './auth.js'
+import { INPUT, RESIZE, OUTPUT, SET_TITLE, SET_SIZE, PROCESS } from './protocol.js'
+import { ask, endOne, indexArgument, matching, pickFrom } from './picker.js'
+
+// Ctrl-] detaches, the way telnet and ssh do it. Not Ctrl-\, which pi wants,
+// and not Ctrl-C or Ctrl-Z, which are the whole point of passing through.
+//
+// The snapshot's preamble enables the kitty keyboard protocol, so a terminal
+// that honors it reports Ctrl-] as `ESC[93;5u` — the ] codepoint with the
+// ctrl bit set — instead of the raw 0x1d byte. Both are the same chord.
+const DETACH = 0x1d
+const DETACH_KITTY = /\x1b\[93(:[0-9]+)?;\d+u/
+
+// Detaching leaves the server up for the phone, so it must not report itself
+// as the session ending.
+const DETACHED = 3
+
+// The supervisor's code for the session itself being over — pi exited, or
+// someone ended it. Every other way a socket can close here is this terminal
+// failing to stay attached, and reports itself as a failure.
+const SESSION_ENDED = 1001
+
+// Same chord in either encoding.
+export const isDetach = chunk => chunk.includes(DETACH) || DETACH_KITTY.test(chunk)
+
+// The chord is the one thing a viewer cannot discover on its own, so say it
+// once on the way in. Long enough to read, short enough not to be in the way.
+const BANNER = '\r\n\r\n    [afield] Ctrl-] to detach\r\n\r\n'
+const BANNER_MS = 2000
+const LAST_SESSION = join(homedir(), '.afield-last-terminal')
+
+const frame = (cmd, text) => Buffer.concat([Buffer.from([cmd]), Buffer.from(text)])
+
+// A place this terminal wrote on its way out, or null. Unreadable, truncated,
+// or from a build that stored something else: all of them mean the same thing
+// here, which is that there is no previous session to reattach to.
+async function readLastSession() {
+  try { return JSON.parse(await readFile(LAST_SESSION, 'utf8')) } catch { return null }
+}
+
+const rememberSession = place => writeFileSync(LAST_SESSION, JSON.stringify(place), { mode: 0o600 })
+
+// `GET /places`, with optional query params. The parsed body, or null after
+// printing why a listing could not be read.
+async function getPlaces(url, headers, params = {}) {
+  const listUrl = new URL(url)
+  listUrl.protocol = listUrl.protocol === 'wss:' ? 'https:' : 'http:'
+  listUrl.pathname = '/places'
+  for (const [key, value] of Object.entries(params)) listUrl.searchParams.set(key, value)
+  const res = await fetch(listUrl, { headers })
+  if (!res.ok) {
+    // 401 is the common one: a cookie the supervisor no longer honours.
+    console.error(res.status === 401 ? `attach: the server's sign-in key is not the one at ${keyPath()}`
+      : `attach: could not list sessions (HTTP ${res.status})`)
+    return null
+  }
+  return res.json()
+}
+
+/**
+ * Which session to join: a running row selected by a bare number, the one a
+ * substring of `match` picks out uniquely, or, failing either, a numbered prompt.
+ *
+ * Reads `GET /places` rather than a fixed id, since sessions come and go — the
+ * list this shows is exactly the one the phone's menu would.
+ */
+export async function resolveSession(url, { session, match, headers }) {
+  if (typeof session === 'string') return { processId: session }
+
+  const { sessions } = await getPlaces(url, headers) ?? {}
+  if (!sessions) return null
+  if (session) {
+    // A remembered session a server restart unlisted is still joinable by its
+    // own id, which also covers a fork -- the list this falls back past never
+    // shows one, yet `rememberSession` will happily have recorded it.
+    // A remembered place can have no processId, and non-running rows have
+    // none either, so only compare when there is one to compare -- otherwise
+    // this matches the first listed row that happens not to be running.
+    const previous = (session.processId && sessions.find(s => s.processId === session.processId))
+      ?? sessions.find(s => s.id === session.id && s.cwd === session.cwd)
+      ?? (session.id && await getPlaces(url, headers, { id: session.id }))?.sessions[0]
+    if (!previous) console.error('attach: previous conversation is no longer listed')
+    return previous ?? null
+  }
+  if (sessions.length === 0 && !match) {
+    console.error('attach: no sessions to join yet')
+    return null
+  }
+
+  const index = indexArgument(match)
+  if (index !== null) {
+    const running = sessions.filter(s => s.running)
+    if (!Number.isSafeInteger(index) || index < 1 || index > running.length) {
+      console.error(`attach: no running session numbered ${match}`)
+      return null
+    }
+    return running[index - 1]
+  }
+
+  const candidates = match ? matching(sessions, match) : sessions
+  if (candidates.length === 1) return candidates[0]
+  if (candidates.length === 0) {
+    // The listing omits forked sessions, so a fragment can name a session the
+    // menu never showed; the server still answers that one, by exact id.
+    const exact = match ? (await getPlaces(url, headers, { id: match }))?.sessions[0] : null
+    if (exact) return exact
+    console.error(`attach: nothing matches ${JSON.stringify(match)}`)
+    return null
+  }
+
+  console.error('attach: which session?')
+  const choice = await pickFrom(candidates, { ask, out: console.error })
+  return choice ?? null
+}
+
+export async function attach({ url, session, match, previous = false }) {
+  if (previous && !session) {
+    session = await readLastSession()
+    if (!session) {
+      console.error('attach: no previous session to reattach')
+      process.exit(1)
+    }
+  }
+
+  const { stdin, stdout } = process
+  if (!stdin.isTTY) {
+    console.error('attach: not a terminal')
+    process.exit(2)
+  }
+
+  // Before the terminal is touched, so a refusal leaves it exactly as found.
+  const headers = keyHeaders()
+
+  let place = await resolveSession(url, { session, match, headers })
+  if (!place) process.exit(1)
+  const target = new URL(url)
+  if (place.processId) target.searchParams.set('process', place.processId)
+  else {
+    target.searchParams.set('session', place.id)
+    target.searchParams.set('cwd', place.cwd)
+  }
+
+  const ws = new WebSocket(target, ['tty'], { headers })
+  let restored = false
+  let inputHandler, resizeHandler, timer
+
+  // The snapshot's preamble leaves the terminal in the kitty keyboard protocol
+  // and bracketed paste, and pi's own frames leave the cursor hidden and may
+  // leave synchronized output holding. Undo all of it on the way out, or the
+  // shell that comes back is fed escape-encoded keys and has no cursor.
+  const UNPREP = '\x1b[?2026l\x1b[<1u\x1b[?2004l\x1b[?25h'
+
+  // One restore path for every exit, including a throw: leaving a terminal in
+  // raw mode is the kind of bug that outlives the process that caused it.
+  const restore = () => {
+    if (restored) return
+    restored = true
+    stdout.write(UNPREP)
+    if (stdin.isRaw) stdin.setRawMode(false)
+    stdin.pause()
+  }
+  // Restores the terminal before writing: a message printed in raw mode
+  // staircases. Diagnostics go to stderr, so the reason a terminal detached
+  // itself survives `attach > somewhere`; the two messages that are part of
+  // the session on screen ask for stdout by name.
+  const leave = (message, code = 0, stream = process.stderr) => {
+    restore()
+    if (message) stream.write(`\r\n${message}\r\n`)
+    process.exit(code)
+  }
+  const onExit = restore
+  const onUncaughtException = err => { restore(); throw err }
+  // Killed from outside, the terminal still gets restored.
+  const onSigterm = () => leave()
+  const onSighup = () => leave()
+  process.on('exit', onExit)
+  process.on('uncaughtException', onUncaughtException)
+  process.on('SIGTERM', onSigterm)
+  process.on('SIGHUP', onSighup)
+
+  const size = () => ({ columns: stdout.columns || 80, rows: stdout.rows || 24 })
+
+  ws.on('open', () => {
+    stdin.setRawMode(true)
+    stdin.resume()
+
+    // The server sends nothing until this hello, so holding it back gives the
+    // banner the screen to itself and the snapshot repaints over it. No output
+    // is buffered or lost here — none has been asked for yet.
+    stdout.write(`\x1b[2J\x1b[H${BANNER}`)
+    let started = false
+    const start = () => {
+      if (started) return
+      started = true
+      clearTimeout(timer)
+      ws.send(JSON.stringify({ client: 'attach', ...size() }))
+      resizeHandler = () => ws.send(frame(RESIZE, JSON.stringify(size())))
+      stdout.on('resize', resizeHandler)
+    }
+    timer = setTimeout(start, BANNER_MS)
+
+    inputHandler = chunk => {
+      if (isDetach(chunk)) leave(
+        'detached; the session is still running\r\n' +
+        '  rejoin it   afield attach\r\n' +
+        '  end it      afield end [fragment|n]\r\n' +
+        '  end all     Ctrl-C in the terminal serving it', DETACHED, stdout)
+      // The key that dismisses the banner is spent doing so: the session has
+      // not been shown yet, so it was not typed at what is about to appear.
+      if (!started) return start()
+      ws.send(frame(INPUT, chunk))
+    }
+    stdin.on('data', inputHandler)
+  })
+
+  let announced = null
+  let receivedProcess = false
+
+  ws.on('message', data => {
+    const buf = Buffer.from(data)
+    if (buf[0] === OUTPUT) {
+      // A terminal that cannot keep up must slow the socket down rather than
+      // let the server's queue grow until it disconnects us.
+      if (!stdout.write(buf.subarray(1))) {
+        ws._socket.pause()
+        stdout.once('drain', () => ws._socket.resume())
+      }
+    }
+    else if (buf[0] === PROCESS) {
+      receivedProcess = true
+      place = { ...place, ...JSON.parse(buf.subarray(1).toString()) }
+      rememberSession(place)
+    }
+    else if (buf[0] === SET_TITLE) stdout.write(`\x1b]0;${buf.subarray(1)}\x07`)
+    else if (buf[0] === SET_SIZE) {
+      // A real terminal cannot be resized from in here, so when a narrower
+      // viewer owns the grid the program simply draws in part of this window.
+      // Say so once, or it reads as a rendering fault.
+      const { columns, rows } = JSON.parse(buf.subarray(1))
+      const note = `${columns}x${rows}`
+      if (note !== announced && columns < size().columns) {
+        stdout.write(`\r\n[drawing at ${note} — a narrower viewer owns the grid]\r\n`)
+      }
+      announced = note
+    }
+  })
+
+  ws.on('close', async (code, reason) => {
+    if (code === 4006 && !receivedProcess) {
+      clearTimeout(timer)
+      if (inputHandler) stdin.removeListener('data', inputHandler)
+      if (resizeHandler) stdout.removeListener('resize', resizeHandler)
+      restore()
+      if (await endOne(url, headers)) {
+        process.removeListener('exit', onExit)
+        process.removeListener('uncaughtException', onUncaughtException)
+        process.removeListener('SIGTERM', onSigterm)
+        process.removeListener('SIGHUP', onSighup)
+        return attach({ url, session: { id: place.id, cwd: place.cwd } })
+      }
+      return leave(null, 1)
+    }
+    leave(
+      code === 1013 ? 'disconnected: this terminal fell too far behind' : `disconnected (${code}) ${reason}`,
+      code === SESSION_ENDED ? 0 : 1)
+  })
+  ws.on('error', err => leave(`attach: ${err.message}`, 1))
+}

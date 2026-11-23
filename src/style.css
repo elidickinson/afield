@@ -1,0 +1,529 @@
+/* The whole UI: a terminal that fills the visual viewport, a key bar under it,
+   and a sheet menu over both. */
+:root {
+  --font: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* Color themes. `dark` is the default. The menu offers a switch that works
+   live (client-only), and the server can also bake one in with --theme. The
+   terminal's ANSI palette lives here rather than in wterm's defaults so one
+   set of variables drives both the terminal and the chrome around it. */
+:root.theme-dark {
+  --bg: #0b0b0d;
+  --fg: #d8d8dc;
+  --chrome: #17171b;
+  --edge: #2c2c33;
+  --accent: #4c9aff;
+  --on-accent: #001;
+  --muted: #8a8a95;
+  --faint: #6f6f7a;
+  --inset: #0d0d11;
+  --raised: #22222a;
+  --pressed: #33333c;
+  --danger: #d46a5f;
+
+  --term-0: #1e1e1e;   --term-1: #f44747; --term-2: #6a9955; --term-3: #d7ba7d;
+  --term-4: #569cd6;   --term-5: #c586c0; --term-6: #4ec9b0; --term-7: #d4d4d4;
+  --term-8: #808080;   --term-9: #f44747; --term-10: #6a9955; --term-11: #d7ba7d;
+  --term-12: #569cd6;  --term-13: #c586c0; --term-14: #4ec9b0; --term-15: #ffffff;
+  --cursor: #5293ff;
+}
+
+:root.theme-light {
+  --bg: #fafafa;
+  --fg: #24262b;
+  --chrome: #f4f4f5;
+  --edge: #d4d4dc;
+  --accent: #3b6fe0;
+  --on-accent: #fff;
+  --muted: #76767e;
+  --faint: #9a9aa2;
+  --inset: #e9e9ec;
+  --raised: #e6e6ea;
+  --pressed: #d9d9df;
+  --danger: #b42318;
+
+  --term-0: #24262b;   --term-1: #d13932; --term-2: #3a813d; --term-3: #a86a10;
+  --term-4: #3b6fe0;   --term-5: #9b3f97; --term-6: #2f7b8f; --term-7: #c2c2cc;
+  --term-8: #9a9aa2;   --term-9: #d13932; --term-10: #3a813d; --term-11: #a86a10;
+  --term-12: #3b6fe0;  --term-13: #9b3f97; --term-14: #2f7b8f; --term-15: #5a5a63;
+  --cursor: #3b6fe0;
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.2 var(--font);
+  /* The page itself never scrolls; only the terminal does. */
+  overflow: hidden;
+  overscroll-behavior: none;
+  /* overflow alone does not stop iOS panning the page up over the keyboard
+     from a drag that starts where no scroller claims it: the key bar's edges,
+     the gaps between keys, the side insets. touch-action only counts up to the
+     nearest scroller, so this reaches just the surfaces that do not scroll. */
+  touch-action: none;
+}
+
+#safe-probe {
+  position: fixed;
+  top: 0; left: 0;
+  width: 0; height: 0;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  pointer-events: none;
+  visibility: hidden;
+}
+
+#cell-probe {
+  position: fixed;
+  visibility: hidden;
+  white-space: pre;
+  font-family: var(--font);
+  line-height: 1.2;
+}
+
+/* Sized from visualViewport in JS — never height:100%, which is the layout
+   viewport and hides the bottom of the screen behind the keyboard. The side
+   insets come from JS too, not env(): Chrome on Android reports a side cutout
+   it has already kept the page clear of (see deriveLayout). */
+#app {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  padding: 0 var(--inset-right) 0 var(--inset-left);
+  display: flex;
+  flex-direction: column;
+}
+
+#tabs {
+  position: absolute;
+  top: 0;
+  left: var(--inset-left);
+  right: var(--inset-right);
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: calc(30px + env(safe-area-inset-top));
+  padding: env(safe-area-inset-top) 4px 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font: 600 11px/1.35 var(--font);
+  background: color-mix(in srgb, var(--chrome) 50%, transparent);
+  backdrop-filter: blur(6px);
+}
+#tabs .tab { flex: 0 0 auto; border: 0; border-radius: 6px; padding: 3px 8px; background: var(--raised); color: var(--fg); font: inherit; }
+#tabs .tab[aria-current="true"] { background: var(--pressed); color: var(--accent); }
+#tabs .tab.unread .tab-name::before { content: '● '; color: var(--accent); }
+#tabs .tab.working .tab-name::before { content: '⏳️ '; }
+
+.tabs-arrow {
+  position: absolute;
+  top: 0;
+  z-index: 7;
+  height: calc(30px + env(safe-area-inset-top));
+  padding: env(safe-area-inset-top) 6px 0;
+  border: 0;
+  background: color-mix(in srgb, var(--edge) 85%, transparent);
+  color: var(--fg);
+  font: 14px/1 var(--font);
+}
+#tabs-left { left: var(--inset-left); }
+#tabs-right { right: var(--inset-right); }
+
+#viewport {
+  flex: 1;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior: contain;
+  /* Sideways only: a vertical drag it let through would pan the page. */
+  touch-action: pan-x;
+}
+
+#stage { position: relative; }
+
+/* The wterm mount. It owns vertical scroll, so scrollback gets native momentum
+   scrolling and selection handles. */
+#screen {
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  /* Say so explicitly: a vertical drag here scrolls, it is not a gesture for
+     the horizontal scroller wrapped around it to claim. */
+  touch-action: pan-y;
+  overscroll-behavior: contain;
+  /* The app owns scroll position wherever content moves -- follow-output,
+     keyboard pinning, resize restoration, and the renderer's window swaps,
+     which detach and re-insert scrollback rows on every render. UA anchoring
+     would be a second actor doing the same job off its own choice of anchor:
+     when rows are detached, WebKit picks a live grid row below the insertion
+     point, after which each appended history row pushes the anchor down and
+     walks the box with it -- a parked reader creeps one row per line of
+     output. */
+  overflow-anchor: none;
+}
+
+/* app.js hides the grid's blank tail; this puts what is left against the key bar
+   rather than at the top with the gap underneath. `margin-top` on the grid and
+   not `justify-content: flex-end` on the scroller, which would put the top of an
+   overflowing transcript out of reach. */
+.term-grid { margin-top: auto; }
+
+/* wterm ships desktop-window chrome — padding, rounding, a drop shadow. On a
+   phone the terminal is the whole screen. */
+#screen.wterm {
+  --term-font-family: var(--font);
+  --term-bg: var(--bg);
+  --term-fg: var(--fg);
+  --term-cursor: var(--cursor);
+  --term-color-0: var(--term-0);   --term-color-1: var(--term-1);
+  --term-color-2: var(--term-2);   --term-color-3: var(--term-3);
+  --term-color-4: var(--term-4);   --term-color-5: var(--term-5);
+  --term-color-6: var(--term-6);   --term-color-7: var(--term-7);
+  --term-color-8: var(--term-8);   --term-color-9: var(--term-9);
+  --term-color-10: var(--term-10); --term-color-11: var(--term-11);
+  --term-color-12: var(--term-12); --term-color-13: var(--term-13);
+  --term-color-14: var(--term-14); --term-color-15: var(--term-15);
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* `relative` so the pad can hang off the bar's top edge wherever the insets
+   and the strip leave it. */
+#bar {
+  position: relative;
+  height: var(--bar-h);
+  flex: 0 0 var(--bar-h);
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  /* The bar bleeds to the edge of the glass; the keys stay out of the corner
+     curve. Vertical clearance is the bar's own padding, set from the insets. */
+  padding-inline: 8px;
+  background: var(--edge);
+  border-top: 1px solid var(--edge);
+}
+
+#keys {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+}
+
+/* The arrow pad: a floating cluster over the terminal, anchored to the bar's
+   top edge. Out of flow, so opening it never reflows the grid the way a second
+   bar row would. Above the way-back button, which it would otherwise sit
+   under. Translucent and frosted: it hangs over live output, which stays
+   readable through it without competing with the arrows. */
+#pad {
+  position: absolute;
+  right: 8px;
+  bottom: calc(100% + 8px);
+  z-index: 6;
+  display: flex;
+  gap: 1px;
+  padding: 4px;
+  background: color-mix(in srgb, var(--edge) 65%, transparent);
+  border-radius: 10px;
+  box-shadow: 0 4px 14px rgb(0 0 0 / .5);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+
+#pad button {
+  /* Narrower than an arrow's 52px so six keys still fit a phone's width with
+     the pad's padding and gaps; the ⇈/⇊ doubles read fine at 19px. */
+  width: 46px;
+  height: 52px;
+  border: 0;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--chrome) 65%, transparent);
+  color: var(--fg);
+  font: 19px/1 var(--font);
+  touch-action: none;
+}
+
+#pad button:active { background: color-mix(in srgb, var(--pressed) 65%, transparent); }
+
+#keys button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: var(--chrome);
+  color: var(--fg);
+  font: 18px/1 var(--font);
+  touch-action: none;
+}
+
+#keys button:active { background: var(--pressed); }
+#keys button.word { font-size: 14px; }
+#keys button.wide { font-size: 22px; }
+/* The ↑↓ toggle reads finer than the other ~22px glyphs at the same size. */
+#keys button[name="arrow pad"] { font-size: 15px; }
+#keys button.sticky { background: var(--accent); color: var(--on-accent); }
+
+/* The status strip: one grid row tall, under the keys. In standalone the
+   home-indicator band absorbs it, so the terminal keeps every row; where there
+   is no band (keyboard up, Safari) the bar grows by exactly the strip and the
+   terminal box gives up the row. Its height is set from the measured cell in
+   JS. The strip never touches the grid, so it never reflows pi. */
+#strip {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--chrome);
+  border-top: 1px solid var(--edge);
+  color: var(--muted);
+  font: 11px/1.35 var(--font);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* Only ever visible when the socket is not up. A frozen terminal otherwise
+   looks exactly like a busy one. Kept clear of the notch in landscape. */
+#conn {
+  position: fixed;
+  top: calc(env(safe-area-inset-top) + 6px);
+  right: calc(var(--inset-right) + 8px);
+  z-index: 8;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(58, 36, 22, .9);
+  color: #f0c48a;
+  font-size: 12px;
+  line-height: 1;
+  animation: conn-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes conn-pulse { 50% { opacity: .35; } }
+
+#to-bottom {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border: 1px solid var(--edge);
+  border-radius: 14px;
+  background: var(--chrome);
+  color: var(--fg);
+  font: 12px var(--font);
+  z-index: 5;
+}
+
+/* `display` on an id selector beats the `hidden` attribute's UA rule, so an
+   invisible overlay would still swallow every tap — and so would `.term-row`,
+   which is what the grid's blank-tail trim rides on. */
+[hidden] { display: none !important; }
+
+/* Anchored to the top, because it exists to explain a broken bottom. */
+#diag-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 0;
+  padding: 8px;
+  background: #2b1416;
+  border-bottom: 1px solid #7a2b32;
+  color: #e8c8cc;
+  font: 11px/1.45 var(--font);
+  white-space: pre-wrap;
+}
+
+#menu {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .55);
+  display: flex;
+  align-items: flex-end;
+  z-index: 10;
+}
+
+.menu-card {
+  width: 100%;
+  background: var(--chrome);
+  border-top: 1px solid var(--edge);
+  padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+  /* The sheet grows from the bottom, so without a ceiling a tall card runs off
+     the top of the screen taking `Done` with it — and the folder list is as
+     long as the number of projects you have. */
+  max-height: 88vh;
+  overflow-y: auto;
+}
+
+.menu-head { margin: 10px 0 5px; color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.menu-toggle { padding: 5px 0; }
+.menu-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* Rows are usually separated by their heading. Where two run together the gap
+   has to come from somewhere, or the paste field sits straight on the buttons
+   under it. */
+.menu-row + .menu-row { margin-top: 8px; }
+
+/* The state line is the sheet's title bar, and Done sits at the end of it —
+   directly over Reload app, which is not what anyone reaching for Done meant
+   to hit. A rule and some room make them two different things. */
+.menu-card > .menu-row:first-child {
+  padding-bottom: 10px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--edge);
+}
+.menu-row input[type=text] {
+  flex: 2;
+  min-width: 0;
+  padding: 10px 8px;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: var(--inset);
+  color: var(--fg);
+  font: 13px var(--font);
+}
+
+.menu-row button {
+  flex: 1;
+  padding: 10px 8px;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: var(--raised);
+  color: var(--fg);
+  font: 13px var(--font);
+}
+
+/* The theme switch shares the grid row; it never needs the full row width, so
+   it sizes to its label and reads as a secondary control next to the presets.
+   `sticky` is the same accent as the key bar's sticky modifiers. */
+.menu-row button[data-theme] {
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  font-size: 12px;
+}
+.menu-row button[data-theme].sticky { background: var(--accent); color: var(--on-accent); }
+
+#menu-state { flex: 1; color: var(--muted); }
+#menu-notice { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+
+/* Its own scroller: there is a folder here for every directory pi has ever run
+   in, which on a working machine is a hundred of them. The card must not grow
+   off the top of the screen to hold them. */
+#places {
+  max-height: 34vh;
+  overflow-y: auto;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: var(--inset);
+}
+
+.place + .place, .place + .place-row, .place-row + .place-row { border-top: 1px solid var(--edge); }
+
+/* A row is a session, not a folder: tapping it joins straight away, so it is
+   a plain button rather than a two-step disclose-then-act control. Joining
+   never ends anything else, so there is no confirming second tap to design
+   for the way switching used to need. */
+.place {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  background: none;
+  color: var(--fg);
+  font: 13px var(--font);
+  text-align: left;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The name is pi's folder; the path is what tells two `extensions` apart. */
+.place-path { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--muted); font-size: 11px; }
+.place-path-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.place-watchers { margin-left: auto; white-space: nowrap; }
+
+/* Where you already are, so a list of a hundred rows still says which is this. */
+.place.here .place-name::after { content: ' ·'; color: var(--accent); }
+
+/* Every session row keeps the same slot ahead of its name, so names line up
+   whatever it holds: working, unread, running, or nothing for a saved one. */
+.place-row .place-name::before { content: ''; display: inline-block; width: 2ch; text-align: center; }
+.place.running .place-name::before { content: '○'; color: var(--faint); }
+.place.unread .place-name::before { content: '●'; color: var(--accent); }
+.place.working .place-name::before { content: '⏳️'; }
+
+/* The end action is a sibling button over the row's right edge, not a nested
+   control. Its width and the row's reserved space stay fixed while confirming. */
+.place-row { position: relative; }
+.place-row.has-end > .place { padding-right: 92px; }
+.place-end {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  min-width: 72px;
+  padding: 8px 10px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: 12px var(--font);
+  text-align: right;
+}
+.place-end.confirm { color: var(--danger); font-weight: 600; }
+
+.place-more {
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: 12px var(--font);
+  text-align: center;
+}
+
+/* Starting options share a row; folder choices are one step of two. */
+.place-starts { display: flex; border-bottom: 1px solid var(--edge); }
+.place-starts .place { flex: 1; width: 50%; min-width: 0; }
+.place-starts .place + .place { border-left: 1px solid var(--edge); }
+.place.start .place-name { color: var(--accent); }
+.place.dir .place-name { color: var(--fg); }
+.place.dir .place-path { min-height: 0; }
+.place-heading { padding: 8px 10px; color: var(--muted); font-size: 12px; }
+.place-heading.pool { color: var(--accent); font-size: 13px; }
+
+#place-now { text-transform: none; color: var(--faint); }
+
+#diag {
+  margin: 0;
+  padding: 8px;
+  background: var(--inset);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  color: var(--muted);
+  font: 11px/1.45 var(--font);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}

@@ -1,0 +1,614 @@
+// The session picker. A row acts the moment it is tapped — joining never ends
+// anything else — so what matters is that a tap lands somewhere real, that the
+// list says where you are and what is still running, and that a session with
+// no transcript yet can be begun from the same list.
+import { test, expect, ready } from './helpers.js'
+import { readFile, unlink, utimes, writeFile } from 'node:fs/promises'
+import { basename, join } from 'node:path'
+
+test.use({ folders: ['alpha', 'beta'] })
+
+const openMenu = async page => {
+  await page.locator('#keys button[aria-label="menu"]').tap()
+  await expect(page.locator('#menu')).toBeVisible()
+}
+
+const rows = page => page.locator('#places .place')
+
+const seedHistory = async store => {
+  const folder = join(store.sessionDir, `-${process.cwd().replaceAll('/', '-')}-`)
+  for (let i = 0; i < 220; i++) {
+    await writeFile(join(folder, `fill-${i}.jsonl`),
+      `${JSON.stringify({ type: 'session', version: 3, id: `fill-${i}`, cwd: process.cwd() })}\n`)
+  }
+  return folder
+}
+
+/** The place the page remembered under `key`, as the app stores it. */
+const storedPlace = (page, key) => page.evaluate(key => {
+  try { return JSON.parse(localStorage.getItem(key)) } catch { return null }
+}, key)
+
+// The cwd the test server starts in: the runner's own, seeded oldest so a
+// spec that also asks for folders lands on the newest of those instead. Taken
+// from the same value helpers seeds it with, so the checkout can be named
+// anything.
+const HERE = basename(process.cwd())
+
+test('the menu lists every session plus the row that starts one', async ({ page }) => {
+  await ready(page)
+  await openMenu(page)
+
+  // One seeded session per folder plus the cwd's own, with labels drawn from
+  // each transcript (the fixtures have no conversation, so the folder name
+  // is the label), and pinned at the top, the way to start a session that
+  // has none yet.
+  await expect.poll(async () => (await page.locator('#places .place-name').allInnerTexts()).sort())
+    .toEqual(['+ New pi session', '+ New terminal', 'alpha', 'beta', HERE])
+  // beta is the newest seed, so a fresh viewer lands on that session.
+  await expect(page.locator('#places .place.here .place-name')).toHaveText('beta')
+  await expect(page.locator('#place-now')).toContainText('beta')
+  // The header and the row spell the folder the same way, both straight from
+  // the place frame rather than formatted twice.
+  const rowPath = await page.locator('#places .place.here .place-path-text').textContent()
+  await expect(page.locator('#place-now')).toHaveText(rowPath.split(' · ')[0])
+})
+
+test('tabs switch between running sessions', async ({ page }) => {
+  await ready(page)
+  await openMenu(page)
+  await rows(page).filter({ hasText: 'alpha' }).tap()
+  await expect(page.locator('#screen')).toContainText('alpha')
+  await openMenu(page)
+  await page.locator('#tabs-toggle').tap()
+
+  const tabs = page.locator('#tabs .tab')
+  await expect(tabs).toHaveCount(2)
+  await page.locator('#menu [data-act="close"]').tap()
+  const other = page.locator('#tabs .tab:not([aria-current="true"])')
+  const label = await other.locator('.tab-name').evaluate(n => n.lastChild.textContent)
+  await other.tap()
+  await expect(page.locator('#screen')).toContainText(label)
+})
+
+test('ending another session from the menu takes its tab away', async ({ page }) => {
+  await ready(page)
+  await openMenu(page)
+  await rows(page).filter({ hasText: 'alpha' }).tap()
+  await expect(page.locator('#screen')).toContainText('alpha')
+  await openMenu(page)
+  await page.locator('#tabs-toggle').tap()
+  await expect(page.locator('#tabs .tab')).toHaveCount(2)
+
+  const end = rows(page).filter({ hasText: betaLabel() }).first().locator('xpath=..').locator('.place-end')
+  // Past the refresh the join itself sets off, which would stand in for the
+  // one the End owes.
+  await page.waitForTimeout(1500)
+  await end.tap()
+  await end.tap()
+  await expect(page.locator('#tabs .tab')).toHaveCount(1)
+})
+
+test("the tab bar's right arrow shows while tabs overflow and scrolls them into view", async ({ page }) => {
+  // Narrow enough that six unmarked tabs overflow.
+  await page.setViewportSize({ width: 300, height: 812 })
+  await ready(page)
+  // Six tabs in a phone-width bar: five more sessions in beta's own cwd.
+  const cwd = await page.evaluate(async () => (await (await fetch('/places')).json()).sessions.find(s => s.running).cwd)
+  await page.evaluate(async cwd => {
+    for (let i = 0; i < 5; i++) await fetch('/start', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cwd }),
+    })
+  }, cwd)
+  await openMenu(page)
+  await page.locator('#tabs-toggle').tap()
+  await expect(page.locator('#tabs .tab')).toHaveCount(6)
+  await page.locator('#menu [data-act="close"]').tap()
+  await expect(page.locator('#tabs-right')).toBeVisible()
+  await expect(page.locator('#tabs-left')).toBeHidden()
+  await page.locator('#tabs-right').tap()
+  await expect.poll(() => page.locator('#tabs').evaluate(t => t.scrollLeft)).toBeGreaterThan(0)
+  await expect(page.locator('#tabs-left')).toBeVisible()
+  await expect(page.locator('#tabs-right')).toBeHidden()
+})
+
+test('two folders sharing a conversation id remain separate running terminals', async ({ page, store }) => {
+  const file = name => join(store.sessionDir, `-${store.at(name).replaceAll('/', '-')}-`, 'a.jsonl')
+  const alpha = JSON.parse(await readFile(file('alpha'), 'utf8'))
+  const beta = JSON.parse(await readFile(file('beta'), 'utf8'))
+  await writeFile(file('beta'), `${JSON.stringify({ ...beta, id: alpha.id })}\n`)
+
+  await ready(page)
+  await openMenu(page)
+  const alphaRow = rows(page).filter({ hasText: 'alpha' })
+  await alphaRow.tap()
+  await expect(page.locator('#screen')).toContainText('alpha')
+  await openMenu(page)
+  await expect(page.locator('#places .place.here')).toHaveCount(1)
+  await expect(alphaRow).toHaveClass(/here/)
+  await page.locator('#places .place-row > .place').filter({ hasText: 'beta' }).tap()
+  await expect(page.locator('#screen')).toContainText('beta')
+  await openMenu(page)
+  await expect(page.locator('#places .place.here')).toHaveCount(1)
+  await expect(page.locator('#places .place-row.has-end')).toHaveCount(2)
+})
+
+test('a remembered place whose terminal has gone finds its conversation again', async ({ page }) => {
+  await ready(page)
+  const alpha = await page.evaluate(async () => (await (await fetch('/places')).json()).sessions.find(s => s.label === 'alpha'))
+  // What the phone last saw is a process that has since ended. The conversation
+  // it was showing is what it should land on, not simply the newest row.
+  await page.evaluate(place => localStorage.setItem('afield-place', JSON.stringify({ ...place, processId: 'ended-process' })), alpha)
+  await page.reload()
+  await expect(page.locator('#screen')).toContainText('alpha')
+  await openMenu(page)
+  await expect(page.locator('#places .place.here .place-name')).toHaveText('alpha')
+})
+
+test('ending the watched session during a refused start still opens the one asked for', async ({ page }) => {
+  await ready(page)
+  await expect(page.locator('#screen')).toContainText('beta')
+  const { alpha, watched } = await page.evaluate(async () => {
+    const { sessions } = await fetch('/places').then(res => res.json())
+    return {
+      alpha: sessions.find(sess => sess.label === 'alpha'),
+      watched: sessions.find(sess => sess.label === 'beta' && sess.running),
+    }
+  })
+  for (let i = 0; i < 5; i++) {
+    const status = await page.evaluate(async cwd => (await fetch('/start', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cwd }),
+    })).status, watched.cwd)
+    expect(status).toBe(200)
+  }
+  await openMenu(page)
+  await rows(page).filter({ hasText: '+ New pi session' }).tap()
+  await rows(page).filter({ hasText: 'alpha' }).tap()
+  const end = page.locator(`.place-end[data-process-id="${watched.processId}"]`)
+  await expect(end).toBeVisible()
+  await end.tap()
+  await end.tap()
+  await expect(page.locator('#place-now')).toHaveText(alpha.cwd)
+})
+
+test('cancelling during an in-flight end drops the refused start', async ({ page }) => {
+  await ready(page)
+  await expect(page.locator('#screen')).toContainText('beta')
+  const { alpha, beta } = await page.evaluate(async () => {
+    const { sessions } = await fetch('/places').then(res => res.json())
+    return { alpha: sessions.find(sess => sess.label === 'alpha'), beta: sessions.find(sess => sess.running) }
+  })
+  for (let i = 0; i < 5; i++) {
+    expect(await page.evaluate(async cwd => (await fetch('/start', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cwd }),
+    })).status, beta.cwd)).toBe(200)
+  }
+  const endable = await page.evaluate(async () => {
+    const { sessions } = await fetch('/places').then(res => res.json())
+    const attached = new URL(window.afield.conn.url).searchParams.get('process')
+    return sessions.find(sess => sess.running && sess.processId !== attached)
+  })
+  await openMenu(page)
+  await rows(page).filter({ hasText: '+ New pi session' }).tap()
+  await rows(page).filter({ hasText: 'alpha' }).tap()
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  await page.route('**/terminal?process=*', async route => {
+    if (route.request().method() === 'DELETE') await gate
+    await route.continue()
+  })
+  const deletion = page.waitForResponse(res => res.request().method() === 'DELETE' && res.url().includes('/terminal?process='))
+  const end = page.locator(`.place-end[data-process-id="${endable.processId}"]`)
+  await end.tap()
+  await end.tap()
+  const cancelledList = page.waitForResponse(res => res.request().method() === 'GET' && new URL(res.url()).pathname === '/places')
+  await rows(page).filter({ hasText: 'Cancel' }).tap()
+  await cancelledList
+  const refreshedList = page.waitForResponse(res => res.request().method() === 'GET' && new URL(res.url()).pathname === '/places')
+  release()
+  expect((await deletion).ok()).toBeTruthy()
+  await refreshedList
+  await page.waitForLoadState('networkidle')
+  await expect(page.locator('#place-now')).not.toHaveText(alpha.cwd)
+})
+
+test('a rejected selection keeps the last admitted terminal', async ({ page, store }) => {
+  await ready(page)
+  await openMenu(page)
+  const current = await page.locator('#places .place.here .place-name').textContent()
+  const other = current === 'alpha' ? 'beta' : 'alpha'
+  const oldTitle = await page.title()
+  await unlink(join(store.sessionDir, `-${store.at(other).replaceAll('/', '-')}-`, 'a.jsonl'))
+  await page.locator('#places .place-row > .place').filter({ hasText: other }).tap()
+  await expect(page.locator('#menu')).toBeVisible()
+  await expect(page.locator('#menu-notice')).toContainText('no such conversation')
+  await expect.poll(() => page.title()).toBe(oldTitle)
+  await expect(page.locator('#screen')).toContainText(current)
+})
+
+test('a terminal that went away while the phone was off the air ends like any other', async ({ page, context }) => {
+  // A first viewer starts the session, so this page lands on a running row and
+  // dials it by process ID. Joining by conversation instead would simply
+  // spawn a new terminal, which is not the path under test.
+  const first = await context.newPage()
+  await ready(first)
+  const beta = await first.evaluate(async () =>
+    (await (await fetch('/places')).json()).sessions.find(s => s.label === 'beta' && s.running))
+  await first.close()
+
+  await ready(page)
+  await expect.poll(() => page.evaluate(() => window.afield.conn.url)).toContain(`process=${beta.processId}`)
+
+  // The socket goes down and the process dies before the client's next
+  // attempt: the refusal a phone meets coming back after a while, rather than
+  // a selection going wrong.
+  await page.evaluate(async processId => {
+    window.afield.conn.ws.close()
+    await fetch(`/terminal?process=${encodeURIComponent(processId)}`, { method: 'DELETE' })
+  }, beta.processId)
+
+  await expect(page.locator('#menu')).toBeVisible({ timeout: 8_000 })
+  await expect(page.locator('#menu-notice')).toContainText('no longer running')
+  // The header is cleared rather than left naming a terminal nothing is
+  // connected to, and the conversation is what the next visit lands on.
+  await expect.poll(() => page.title()).toBe('afield')
+  await expect.poll(() => storedPlace(page, 'afield-place')).toMatchObject({ id: beta.id, cwd: beta.cwd })
+})
+
+test('a late startup lookup cannot replace an explicit selection', async ({ page }) => {
+  let release
+  const held = new Promise(done => { release = done })
+  let requests = 0
+  await page.route('**/places', async route => {
+    if (++requests === 1) await held
+    await route.continue()
+  })
+  await page.goto('/')
+  await openMenu(page)
+  await expect(rows(page).filter({ hasText: 'alpha' })).toBeVisible()
+  await rows(page).filter({ hasText: 'alpha' }).tap()
+  await expect(page.locator('#screen')).toContainText('alpha')
+  release()
+  await expect.poll(() => page.title()).toContain('/alpha')
+  await openMenu(page)
+  await expect(page.locator('#places .place.here .place-name')).toHaveText('alpha')
+})
+
+test('a row shows when the session was last active', async ({ page, store }) => {
+  await ready(page)
+  await openMenu(page)
+
+  const beta = rows(page).filter({ hasText: 'beta' })
+  // Store timestamps stay with the path text, separate from the viewer count
+  // at the right edge.
+  await expect(beta.locator('.place-path-text')).toContainText(/· (now|[0-9]+[mhd])$/)
+})
+
+test('the menu fits the screen, with the readout folded away', async ({ page }) => {
+  await ready(page)
+  await openMenu(page)
+  await expect.poll(() => rows(page).count()).toBe(5)
+
+  // The session list is as long as the history you have, so the sheet has to
+  // stay inside the screen — `Done` scrolling off the top is how a menu
+  // becomes a trap.
+  await expect(page.locator('#diag')).toBeHidden()
+  const card = await page.evaluate(() => {
+    const el = document.querySelector('.menu-card')
+    const box = el.getBoundingClientRect()
+    return { top: box.top, bottom: box.bottom, viewport: window.innerHeight, visible: el.clientHeight }
+  })
+  expect(card.top).toBeGreaterThanOrEqual(0)
+  expect(card.bottom).toBeLessThanOrEqual(card.viewport + 1)
+  // Against a short list, which is the case that has no excuse: the sheet is
+  // over a terminal somebody is trying to read.
+  // Two start rows and three sessions: still well short of the whole screen.
+  expect(card.visible).toBeLessThan(card.viewport * 0.9)
+
+  // Still reachable for the times it is the only thing that can explain a
+  // fault — and it stands in for the menu rather than stacking under it, or
+  // unfolding it would fill the screen it is meant to be explaining.
+  await page.locator('[data-act=diag]').tap()
+  await expect(page.locator('#diag')).toContainText('build')
+  // Opening the menu took focus from the terminal, and the log has it.
+  await expect(page.locator('#diag')).toContainText(/\d\d:\d\d:\d\d blur/)
+  await expect(page.locator('#places')).toBeHidden()
+  const open = await page.evaluate(() => ({
+    visible: document.querySelector('.menu-card').clientHeight,
+    viewport: window.innerHeight,
+  }))
+  expect(open.visible).toBeLessThan(card.visible)
+
+  // And folding it back brings the menu with it.
+  await page.locator('[data-act=diag]').tap()
+  await expect(page.locator('#places')).toBeVisible()
+  await expect(page.locator('#diag')).toBeHidden()
+})
+
+test('tapping a row joins that session: the screen follows the folder', async ({ page }) => {
+  await ready(page)
+  await openMenu(page)
+  await expect.poll(() => rows(page).count()).toBe(5)
+
+  // One tap: no disclose-then-act, nothing to confirm — joining ends nothing.
+  await rows(page).filter({ hasText: 'beta' }).tap()
+  await expect(page.locator('#menu')).toBeHidden()
+  // The title is the client's word for the folder it asked to join.
+  await expect.poll(() => page.title()).toContain('/beta')
+  // And the program really is over there: the fixture draws its own cwd, which
+  // wraps at this width, so the comparison ignores where the rows break.
+  await expect.poll(async () =>
+    (await page.locator('#screen').innerText()).replace(/\s+/g, '')).toContain('/beta')
+})
+
+test('a live session is marked running, and rejoining it cannot end it', async ({ page, store }) => {
+  await ready(page)
+  await openMenu(page)
+
+  // Join beta, say something memorable, and leave.
+  await rows(page).filter({ hasText: 'beta' }).tap()
+  await expect.poll(async () =>
+    (await page.locator('#screen').innerText()).replace(/\s+/g, '')).toContain('/beta')
+  const ta = page.locator('#screen textarea')
+  await ta.pressSequentially('rejoin-marker')
+  await ta.press('Enter')
+  await expect.poll(async () =>
+    (await page.locator('#screen').innerText()).includes('ok: 13 chars'), { timeout: 8_000 }).toBe(true)
+  await page.goto('about:blank')
+
+  // Back on a fresh page: the menu now marks beta running, and landing on it
+  // again shows the line still there — the same process, not a respawn.
+  await ready(page)
+  await openMenu(page)
+  await expect(rows(page).filter({ hasText: 'beta' })).toHaveClass(/running/)
+  await rows(page).filter({ hasText: 'beta' }).tap()
+  await expect.poll(async () =>
+    (await page.locator('#screen').innerText()).replace(/\s+/g, '')).toContain('rejoin-marker')
+})
+
+test('new session offers the folders pi is already in, and starting one joins it', async ({ page, store }) => {
+  await ready(page)
+  await openMenu(page)
+
+  await rows(page).filter({ hasText: '+ New pi session' }).tap()
+  // The chooser lists this folder first — it is what the row itself offered —
+  // and every folder a listed session runs in, then the walk to anything else.
+  const dirNames = await page.locator('#places .place .place-name').allInnerTexts()
+  expect(dirNames[0]).toBe(HERE)
+  expect(dirNames[1]).toBe('Navigate to folder…')
+  expect(dirNames.slice(2).sort()).toEqual(['alpha', 'beta'])
+  await expect(page.locator('#places .place-heading')).toHaveText('New pi session in:')
+
+  // Starting one in beta spawns a fresh session there and lands on it: the
+  // title names a session the list never had, and the fixture's own cwd line
+  // proves the child really came up in that folder. The id must be one the
+  // seeded store never held — the seeded beta row would satisfy the title
+  // alone, which would make this pass even if /start never ran.
+  const seeded = await page.evaluate(() => fetch('/places').then(r => r.json()))
+  const seededIds = new Set(seeded.sessions.map(s => s.id))
+  await rows(page).filter({ hasText: 'beta' }).tap()
+  await expect.poll(() => page.title()).toContain('/beta')
+  await expect.poll(async () =>
+    (await page.locator('#screen').innerText()).replace(/\s+/g, '')).toContain('/beta')
+  const joined = await page.evaluate(() => fetch('/places').then(r => r.json()))
+  const started = joined.sessions.find(s => !seededIds.has(s.id))
+  expect(started, 'a new id appeared in the list').toBeTruthy()
+  expect(started.running).toBe(true)
+
+  // And it is a place now: back to the menu, it is listed, running, labeled.
+  await openMenu(page)
+  const beta = page.locator(`#places .place-row[data-session-id="${started.id}"] > .place`)
+  await expect(beta).toHaveClass(/running/, { timeout: 8_000 })
+})
+
+/** beta's row label: the folder name — the fresh session there has no history. */
+const betaLabel = () => 'beta'
+
+test('a folder nothing lists is walked to and started in', async ({ page }) => {
+  await ready(page)
+  await openMenu(page)
+  await rows(page).filter({ hasText: '+ New pi session' }).tap()
+  await rows(page).filter({ hasText: 'Navigate to folder…' }).tap()
+
+  // The walk begins in this server's own folder and descends from there.
+  await page.getByRole('button', { name: 'tests', exact: true }).tap()
+  await expect(page.getByRole('button', { name: 'fixtures', exact: true })).toBeVisible()
+  await rows(page).filter({ hasText: `↰ ${HERE}` }).tap()
+  await expect(page.getByRole('button', { name: 'tests', exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: 'tests', exact: true }).tap()
+  await page.getByRole('button', { name: 'fixtures', exact: true }).tap()
+  await rows(page).filter({ hasText: 'Start pi here' }).tap()
+  await expect.poll(() => page.title()).toContain('/fixtures')
+  await expect.poll(async () =>
+    (await page.locator('#screen').innerText()).replace(/\s+/g, '')).toContain('/fixtures')
+})
+
+test('paging includes an older session that moves above the first page', async ({ page, store }) => {
+  // Enough history to overflow the menu's first page, which is the whole
+  // question: a list that quietly stops at a few dozen rows is the bug here.
+  const folder = await seedHistory(store)
+  await ready(page)
+  await openMenu(page)
+
+  const { sessions } = await page.evaluate(() => fetch('/places').then(r => r.json()))
+  const total = sessions.length
+  // The paging row is only drawn once the list is, so waiting for it is
+  // waiting for the first page to land.
+  const more = page.locator('.place-more')
+  await expect(more).toBeVisible()
+  const first = await rows(page).count()
+  expect(first, 'the first page is a page, not the whole list').toBeLessThan(total + 2)
+
+  const listed = await page.locator('.place-row').evaluateAll(rows => rows.map(row => row.dataset.sessionId))
+  const moved = sessions.find(sess => sess.id.startsWith('fill-') && !listed.includes(sess.id))
+  const future = new Date(Date.now() + 60_000)
+  await utimes(join(folder, `${moved.id}.jsonl`), future, future)
+
+  // The two `+ New …` rows are among `rows`, hence the + 2.
+  let shown = first
+  while (shown < total + 2) {
+    await more.tap()
+    await expect.poll(() => rows(page).count()).toBeGreaterThan(shown)
+    shown = await rows(page).count()
+  }
+  await expect(more).toHaveCount(0)
+  await expect(page.locator(`[data-session-id="${moved.id}"]`)).toHaveCount(1)
+})
+
+test('an older-page response cannot append sessions to the folder picker', async ({ page, store }) => {
+  await seedHistory(store)
+  await ready(page)
+  await openMenu(page)
+  await expect(page.locator('.place-more')).toBeVisible()
+
+  let release
+  const held = new Promise(resolve => { release = resolve })
+  let intercepted
+  const pending = new Promise(resolve => { intercepted = resolve })
+  await page.route('**/places?limit=400', async route => {
+    const response = await route.fetch()
+    intercepted()
+    await held
+    await route.fulfill({ response })
+  })
+  await page.locator('.place-more').tap()
+  await pending
+  await rows(page).filter({ hasText: '+ New pi session' }).tap()
+  await expect(rows(page).filter({ hasText: 'Navigate to folder' })).toBeVisible()
+
+  const response = page.waitForResponse('**/places?limit=400')
+  release()
+  await (await response).finished()
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  await expect(page.locator('#places .place-row')).toHaveCount(0)
+  await expect(page.locator('.place-more')).toHaveCount(0)
+})
+
+test('another viewer ending a session tells the bystander why it left', async ({ page, context }) => {
+  await ready(page)
+  const ender = await context.newPage()
+  await ready(ender)
+  await openMenu(ender)
+
+  const endedId = await ender.evaluate(async () => {
+    const { sessions } = await fetch('/places').then(res => res.json())
+    return sessions.find(session => session.label === 'beta' && session.running)?.id
+  })
+  expect(endedId).toBeTruthy()
+  const row = rows(ender).filter({ hasText: betaLabel() }).first()
+  const end = row.locator('xpath=..').locator('.place-end')
+  await end.tap()
+  await end.tap()
+
+  await expect.poll(() => page.title()).toBe('afield')
+  await expect(page.locator('#menu')).toBeVisible()
+  await expect(page.locator('#menu-notice')).toHaveText('ended by a terminal')
+  const isRunning = () => page.evaluate(async id => {
+    const { sessions } = await fetch('/places').then(res => res.json())
+    return sessions.find(session => session.id === id)?.running ?? false
+  }, endedId)
+  await expect.poll(isRunning, { timeout: 8_000 }).toBe(false)
+  await expect.poll(() => page.evaluate(() => window.afield.conn.started)).toBe(false)
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(100)
+    expect(await isRunning()).toBe(false)
+    expect(await page.title()).toBe('afield')
+  }
+})
+
+test('a shared session row shows its viewer count', async ({ page, context }) => {
+  await ready(page)
+  const other = await context.newPage()
+  await ready(other)
+  await openMenu(page)
+
+  const beta = page.locator('#places .place-row').filter({ hasText: 'beta' })
+  await expect(beta.locator('.place-watchers')).toHaveText('2 watching')
+})
+
+test('ending a running session from its row stops it and leaves the menu', async ({ page }) => {
+  await ready(page)
+  await openMenu(page)
+
+  // The landing join has already spawned the seeded beta, so a running row is
+  // on the list without starting anything.
+  const endedId = await page.evaluate(async () => {
+    const { sessions } = await fetch('/places').then(res => res.json())
+    return sessions.find(session => session.label === 'beta' && session.running)?.id
+  })
+  expect(endedId).toBeTruthy()
+  const row = rows(page).filter({ hasText: betaLabel() }).first()
+  const end = row.locator('xpath=..').locator('.place-end')
+  await expect(row).toHaveClass(/running/, { timeout: 8_000 })
+
+  // One tap arms the confirm on the row; a second acts.
+  await end.tap()
+  await expect(end).toHaveText('End it?')
+  await end.tap()
+
+  // The close lands back at the menu. Poll the server, not just the rendered
+  // row: an automatic reconnect would respawn this same session shortly after.
+  await expect.poll(() => page.title()).toBe('afield')
+  const isRunning = () => page.evaluate(async id => {
+    const { sessions } = await fetch('/places').then(res => res.json())
+    return sessions.find(session => session.id === id)?.running ?? false
+  }, endedId)
+  await expect.poll(isRunning, { timeout: 8_000 }).toBe(false)
+  await expect.poll(() => page.evaluate(() => window.afield.conn.started)).toBe(false)
+  await expect(page.locator('#menu-state')).toContainText('disconnected')
+  await expect(page.locator('#menu-notice')).toBeHidden()
+  await expect(row).not.toHaveClass(/running/)
+  await expect(end).toHaveCount(0)
+
+  // Keep checking for three seconds so a delayed retry cannot pass as a clean
+  // end merely because the first post-close snapshot was too early.
+  for (let i = 0; i < 3; i++) {
+    await page.waitForTimeout(1_000)
+    expect(await isRunning()).toBe(false)
+    expect(await page.evaluate(() => window.afield.conn.started)).toBe(false)
+  }
+  await expect.poll(() => page.title()).toBe('afield')
+})
+
+test('a new terminal runs the shell in the folder chosen', async ({ page }) => {
+  await ready(page)
+  await openMenu(page)
+  await rows(page).filter({ hasText: '+ New terminal' }).tap()
+  await rows(page).filter({ hasText: 'this folder' }).tap()
+  await expect(page.locator('#screen')).toContainText('fake-shell ready')
+  // Its row says it is a terminal, beside the pi in the same folder.
+  await openMenu(page)
+  await expect(rows(page).filter({ hasText: `fake-shell.sh · ${HERE}` })).toBeVisible()
+})
+
+test('a terminal refused for a full pool starts once one ends', async ({ page }) => {
+  await ready(page)
+  // Fill the pool with pi sessions beside the watched one.
+  const endable = await page.evaluate(async () => {
+    const { sessions } = await fetch('/places').then(res => res.json())
+    const { cwd } = sessions.find(sess => sess.running)
+    let processId
+    for (let i = 0; i < 5; i++) {
+      const res = await fetch('/start', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cwd }),
+      })
+      if (!res.ok) throw new Error(`/start answered ${res.status}`)
+      ;({ processId } = await res.json())
+    }
+    return processId
+  })
+  await openMenu(page)
+  await rows(page).filter({ hasText: '+ New terminal' }).tap()
+  await rows(page).filter({ hasText: 'this folder' }).tap()
+  await expect(page.locator('#places > .place').first()).toHaveText('‹ Cancel')
+  await expect(page.locator('#places .place-heading')).toContainText('Limit reached (6 running). End one and your new terminal in')
+  const end = page.locator(`.place-end[data-process-id="${endable}"]`)
+  await end.tap()
+  await end.tap()
+  await expect(page.locator('#screen')).toContainText('fake-shell ready')
+})

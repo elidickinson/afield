@@ -1,0 +1,1730 @@
+// The client: wires the terminal to the socket, and owns the layout, the key
+// bar, the menu and the on-screen diagnostics.
+import { WTerm } from '../vendor/wterm/packages/@wterm/dom/src/index.ts'
+import { WasmBridge } from '@wterm/core'
+import { TtydConnection } from './transport.js'
+import { readViewport, rememberKeyboardDown, deriveLayout, horizontalLayout, validVisualHeight, gridFor, measureCell, KEY_BAR_H } from './viewport.js'
+import { keySequence } from './keys.js'
+
+const $ = id => document.getElementById(id)
+const app = $('app')
+const viewport = $('viewport')
+const stage = $('stage')
+const screen = $('screen')
+const bar = $('bar')
+const keys = $('keys')
+const pad = $('pad')
+const strip = $('strip')
+const toBottom = $('to-bottom')
+const menu = $('menu')
+const tabs = $('tabs')
+const tabsLeft = $('tabs-left')
+const tabsRight = $('tabs-right')
+const places = $('places')
+const placeNow = $('place-now')
+const menuNotice = $('menu-notice')
+
+// iOS keeps its own copy of a home-screen app's launch document despite the
+// server's `cache-control: no-cache`. So the page checks for a newer build
+// itself. A meta tag survives minification and reads the same from the live DOM
+// and from a re-fetched copy.
+const buildIdOf = doc => doc.querySelector('meta[name=build]')?.content ?? ''
+const BUILD_ID = buildIdOf(document)
+
+// Sequences written to our own terminal, never sent to pi. ED 3 is specified as
+// erasing only the saved lines, but this VT core erases the visible grid with
+// it — so it is only ever useful alongside ED 2, never on its own.
+const CURSOR_HOME = '\x1b[H'        // CUP: cursor to row 1, column 1
+const ERASE_SCREEN = '\x1b[2J'      // ED 2: erase the visible grid
+const ERASE_SAVED = '\x1b[3J'       // ED 3: erase saved lines, and here the grid too
+
+const BASE_FONT_SIZE = 13
+const MIN_SCALE = 0.4
+const MAX_SCALE = 3
+const ZOOM_STEP = 1.25
+const SETTLE_MS = 200          // viewport values are wrong mid-rotation and mid-keyboard
+const REPEAT_AFTER_MS = 400    // hold an arrow this long before it repeats
+const REPEAT_EVERY_MS = 60
+const PRESETS = [[50, 30], [80, 40], [120, 40], [160, 50]]
+
+const state = {
+  fontSize: BASE_FONT_SIZE,
+  scale: 1,
+  cols: 80,
+  rows: 24,
+  // What we asked the server for. It differs from cols/rows whenever another
+  // viewer is narrower, which is what being letterboxed looks like from here.
+  wanted: { cols: 80, rows: 24 },
+  cell: { width: 8, height: 16 },
+  mods: { ctrl: false, alt: false, shift: false },
+}
+
+// ---------------------------------------------------------------- terminal
+
+// A live PTY has a stable process ID even when pi switches conversations.
+// Keep the requested row separate from the one that actually admitted us.
+let currentPlace = null
+let pendingPlace = null
+let selectionVersion = 0
+let armedEndId = null
+let endArmTimer = null
+const endingIds = new Set()
+let placesRequest = 0
+let poolPickerRequest = 0
+// The picker whose refused action an End may still retry. Cleared once taken, or when the menu is left by hand.
+let retryPicker = null
+let tabsRequest = 0
+let tabsEnabled = false
+// The close code the supervisor sends when the session itself is over — pi
+// exited, or someone ended it — as opposed to an ordinary dropped socket.
+const SESSION_ENDED = 1001
+// The close code range the supervisor reserves for a refused join, as opposed
+// to a dropped socket. A refusal is final; anything else is a phone that lost
+// its network and gets the ordinary backoff.
+const REFUSED = code => code >= 4000 && code < 5000
+// A refusal for a full pool is the one that can be taken back: end something,
+// ask again, and it goes through. Every other refusal is final.
+const POOL_FULL = 4006
+// What the menu is showing. The picker is the one case where a tap on a row
+// ends a session instead of joining it, so it is drawn apart from the list.
+let menuView = 'normal'
+const samePlace = (a, b) => Boolean(a && b && a.id === b.id && a.cwd === b.cwd)
+// What the last visit was looking at, whole: a process ID that is gone means
+// nothing on its own, while the conversation it was showing is still there to
+// reopen.
+const readPlace = key => {
+  try { return JSON.parse(localStorage.getItem(key)) } catch { return null }
+}
+const writePlace = (key, place) => localStorage.setItem(key, JSON.stringify(place))
+const wsBase = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
+// A process ID carries its conversation along: a server restarted since has
+// never heard of the process, and reopens the conversation instead.
+const sessionUrl = place => {
+  const conversation = `session=${encodeURIComponent(place.id)}&cwd=${encodeURIComponent(place.cwd)}`
+  return place.processId
+    ? `${wsBase}?process=${encodeURIComponent(place.processId)}&${conversation}`
+    : `${wsBase}?${conversation}`
+}
+
+// How many rows the menu asks for at a time. Each one returned costs the
+// server a read of its transcript for the label.
+const MENU_PAGE = 200
+
+const fetchPlaces = (window = {}) => {
+  const query = new URLSearchParams()
+  if (window.offset) query.set('offset', window.offset)
+  if (window.limit) query.set('limit', window.limit)
+  if (window.running) query.set('running', '1')
+  return fetch(`/places${query.size ? `?${query}` : ''}`).then(r => r.json())
+}
+async function refreshTabs() {
+  const request = ++tabsRequest
+  const response = await fetchPlaces({ running: true }).then(r => r, err => {
+    console.error('could not refresh tabs', err)
+    return null
+  })
+  if (response === null) return
+  const { sessions } = response
+  if (!sessions) throw new Error('places response has no sessions')
+  if (request !== tabsRequest) return
+  const ordered = [...sessions].sort((a, b) => a.startedAt - b.startedAt)
+  const seen = new Map()
+  tabs.replaceChildren()
+  for (const sess of ordered) {
+    const number = (seen.get(sess.label) ?? 0) + 1
+    seen.set(sess.label, number)
+    const copies = ordered.filter(other => other.label === sess.label).length
+    const button = document.createElement('button')
+    const mark = markOf(sess)
+    button.className = `tab${mark ? ` ${mark}` : ''}`
+    button.dataset.processId = sess.processId
+    if (sess.processId === currentPlace?.processId) button.setAttribute('aria-current', 'true')
+    const name = document.createElement('span')
+    name.className = 'tab-name'
+    if (mark) name.append(srOnly(`${mark} `))
+    name.append(document.createTextNode(`${sess.label}${copies > 1 ? ` ${number}` : ''}`))
+    button.append(name)
+    button.addEventListener('click', () => {
+      if (!conn.started || sess.processId !== currentPlace?.processId) joinSession(sess)
+    })
+    tabs.append(button)
+  }
+  tabs.hidden = !tabsEnabled || ordered.length < 2
+  updateTabArrows()
+}
+function updateTabArrows() {
+  tabsLeft.hidden = tabs.hidden || tabs.scrollLeft <= 0
+  tabsRight.hidden = tabs.hidden || tabs.scrollLeft + tabs.clientWidth >= tabs.scrollWidth - 1
+}
+function refreshPlaces({ preserveNotice = false } = {}) {
+  if (!preserveNotice) clearMenuNotice()
+  const request = ++placesRequest
+  return fetchPlaces({ limit: MENU_PAGE }).then(data => {
+    if (request === placesRequest && menuView === 'normal') showPlaces(data)
+  })
+}
+
+/** The last path segment, for chooser rows and titles. */
+const basename = path => path.slice(path.lastIndexOf('/') + 1)
+
+/** The place to land on when the page first loads: last time's, if it is
+ *  still around, otherwise whatever `/places` says is most recent. One page,
+ *  the same one the menu shows — this is a choice among the recent sessions,
+ *  not a scan of every conversation pi has ever kept. */
+async function resolveInitialPlace() {
+  const { current, sessions } = await fetchPlaces({ limit: MENU_PAGE })
+  const remembered = readPlace('afield-place')
+  // A remembered process that has since ended has no row; the conversation it
+  // was showing does, which is why the whole place was kept rather than a key.
+  return sessions.find(s => remembered?.processId && s.processId === remembered.processId)
+    ?? sessions.find(s => remembered && samePlace(s, remembered))
+    ?? sessions.find(s => s.processId === current)
+    ?? sessions[0]
+    ?? null
+}
+
+/**
+ * The place this viewer is really looking at: whichever one a PROCESS frame
+ * named. Nothing else promotes a requested place, so the header cannot end up
+ * naming a session the screen is not showing.
+ */
+function commitPlace(next) {
+  currentPlace = next
+  pendingPlace = null
+  writePlace('afield-place', currentPlace)
+  // Reconnects redial this, so it follows /new, /resume and a rejoin.
+  conn.url = sessionUrl(currentPlace)
+  placeNow.textContent = currentPlace.path
+  document.title = `${currentPlace.name} — ${currentPlace.path}`
+  if (tabsEnabled) refreshTabs()
+  if (!menu.hidden) refreshPlaces().catch(() => {})
+}
+
+const term = new WTerm(screen, {
+  cols: state.cols,
+  rows: state.rows,
+  autoResize: false,
+  cursorBlink: true,
+  onData: data => conn.send(withMods(data)),
+  // After the paint, before wterm's own scroll pinning: the pin reads the
+  // geometry the trim decides.
+  onAfterPaint: () => trimBlankTail(),
+})
+
+const conn = new TtydConnection({
+  // A placeholder until resolveInitialPlace() picks the real one in main() —
+  // never actually dialed, since connect() is not called until it has.
+  url: wsBase,
+  socketFactory: (url, protocols) => new WebSocket(url, protocols),
+  schedule: (fn, ms) => setTimeout(fn, ms),
+  onOutput: bytes => { lastOutput = Date.now(); deliver(bytes) },
+  onProcess: process => {
+    // Only the live socket's frames get here (transport.js drops the rest), so
+    // each names what the screen shows: a requested place arriving, /new or
+    // /resume, or a rejoin after a server restart under a new process ID.
+    commitPlace({ ...(pendingPlace ?? currentPlace), ...process })
+  },
+  // The title is only restated on a fresh admission, and the strip belongs to
+  // whichever program was running before that. Drop it rather than leave the
+  // last one's model and thinking level sitting under a different session;
+  // the new one's own state comes with its screen.
+  onTitle: title => {
+    clearFooter()
+    document.title = currentPlace ? `${currentPlace.name} — ${currentPlace.path}` : title
+  },
+  onSize: ({ cols, rows }) => { snapshotPending = true; applyServerSize(cols, rows) },
+  onFooter: showFooter,
+  onState: (status, code, reason) => {
+    // 'connecting' covers reconnectNow (which closes the old socket so its
+    // onclose never fires) as well as every ordinary open.
+    if (status !== 'connected') dropHeld()
+    // A refused join is the server saying no: clear what was asked for, drop
+    // the keys typed at a session that never took them, and let the menu say
+    // why. A dropped socket instead keeps its backoff and reconnects silently.
+    // A rejoin after a server restart has nothing pending, but a full pool
+    // refuses it the same way and it can be asked again the same way.
+    const refused = pendingPlace ?? (code === POOL_FULL ? currentPlace : null)
+    if (status === 'disconnected' && REFUSED(code) && refused) {
+      pendingPlace = null
+      conn.stop()
+      conn.discardInput()
+      showConnection('disconnected')
+      // A full pool is the one refusal this viewer can take back: end a
+      // session, ask for this one again.
+      if (code === POOL_FULL) return showPoolFull(`${refused.label} opens`, () => joinSession(refused))
+      showMenuNotice(reason || 'could not join that conversation')
+      openMenu({ preserveNotice: true })
+      return
+    }
+    // 1001 is the server saying the session itself ended, not a dropped
+    // phone. Retrying would spawn a fresh process from the transcript, so the
+    // loop stops and the menu lists what is left instead. A refusal with
+    // nothing pending is the same news arriving late — the terminal this
+    // viewer was on went away while its socket was down — and gets the same
+    // bookkeeping, or the header would keep naming somewhere nothing is.
+    if (status !== 'connected' && (code === SESSION_ENDED || REFUSED(code))) {
+      const endedByThisViewer = endingIds.has(currentPlace?.processId)
+      if (currentPlace) {
+        const conversation = { id: currentPlace.id, cwd: currentPlace.cwd }
+        writePlace('afield-place', conversation)
+      }
+      if (endedByThisViewer) clearMenuNotice()
+      else showMenuNotice(reason || 'terminal ended')
+      conn.stop()
+      conn.discardInput()
+      pendingPlace = null
+      showConnection('disconnected')
+      currentPlace = null
+      document.title = 'afield'
+      openMenu({ preserveNotice: !endedByThisViewer })
+      if (tabsEnabled) refreshTabs()
+      return
+    }
+    showConnection(status)
+  },
+})
+
+/** The menu is hidden by default, so connection state has to live outside it. */
+function showConnection(status) {
+  if (status === 'disconnected') clearFooter()
+  $('menu-state').textContent = `${status} · ${BUILD_ID}`
+  const bolt = $('conn')
+  bolt.textContent = '⚡'
+  bolt.setAttribute('aria-label', status)
+  bolt.title = status
+  bolt.hidden = status === 'connected'
+}
+
+function clearMenuNotice() {
+  menuNotice.textContent = ''
+  menuNotice.hidden = true
+}
+
+function showMenuNotice(text) {
+  menuNotice.textContent = text
+  menuNotice.hidden = false
+}
+
+// Diagnostic seam: the e2e suite and the on-device probe read the same shape.
+// Published before startup finishes so nothing has to guess when it appears.
+window.afield = { conn, term, state, checkForNewBuild }
+
+// ---------------------------------------------------------------- strip
+
+let footerText = null
+
+/**
+ * pi's stats in full, captured by the afield-footer extension and relayed by the
+ * server, but only worth a row in standalone: there the strip sits in the
+ * home-indicator band and costs nothing while the keyboard is down. In a
+ * Safari tab the band is too small and every row is one visible fewer, so the
+ * strip stays hidden there entirely.
+ */
+function setStripVisibility(visible) {
+  if (strip.hidden === !visible) return
+  // Where the bar changes size for the strip, that must not move the eye:
+  // parked readers keep their position, and a view pinned to the live screen
+  // stays pinned (sizeScreen's own bottom-pinning does that).
+  const pinned = atBottom()
+  const top = screen.scrollTop
+  strip.hidden = !visible
+  applyLayout()
+  if (!pinned) screen.scrollTop = top
+}
+
+function clearFooter() {
+  footerText = null
+  strip.textContent = ''
+  setStripVisibility(false)
+}
+
+function showFooter(state) {
+  // Standalone only. `navigator.standalone` is a stable fact of how the page
+  // was opened, so checking it here without storing it is enough. In a Safari
+  // tab the strip is never even drawn: it would cost a row for no gain.
+  if (!readViewport().standalone) return
+  // No model is a state of its own: the strip clears rather than keeping the
+  // last session's model on screen under this one.
+  if (!state.id) return clearFooter()
+  // The line is of this client's making: pi's own footer is truncated at this
+  // width, so the model is named in full nowhere else.
+  footerText = `${state.provider}/${state.id}${state.thinking ? ` - ${state.thinking}` : ''}`
+  strip.textContent = footerText
+  setStripVisibility(true)
+}
+
+// ---------------------------------------------------------------- layout
+
+/** Size the app to the visual viewport — the space above the keyboard. */
+function applyLayout() {
+  // A visual viewport as tall as the document has nowhere to move, so an offset
+  // there is the document itself left scrolled (iOS does this rotating out of a
+  // landscape launch). The fixed #app already ignores that scroll; following
+  // the offset would push it down a second time. The page never scrolls by
+  // design, so put it back before measuring. Not innerHeight: iOS shrinks that
+  // by the distance scrolled when it pans the page to show a focused field.
+  const { height } = visualViewport
+  if (!validVisualHeight(height)) return null
+  if (height >= document.documentElement.clientHeight) window.scrollTo(0, 0)
+  const snap = readViewport()
+  const l = deriveLayout(snap, { stripHeight: strip.hidden ? 0 : state.cell.height })
+  if (!l) return null
+  if (l.keyboardUp) awaitingKeyboard = false
+  app.style.height = `${l.appHeight}px`
+  app.style.transform = `translateY(${snap.offsetTop}px)`
+  app.style.setProperty('--inset-left', `${l.insetLeft}px`)
+  app.style.setProperty('--inset-right', `${l.insetRight}px`)
+
+  // The bar covers the home-indicator inset rather than leaving a gap under it.
+  // flex-basis alone sizes a column flex item; `height` would be a third layer
+  // saying the same thing, after the CSS var that covers the first paint.
+  bar.style.flexBasis = `${l.keyBarHeight}px`
+  bar.style.paddingBottom = `${l.keyBarPadBottom}px`
+
+  toBottom.style.bottom = `${l.keyBarHeight + 10}px`
+
+  sizeScreen()
+  return l
+}
+
+/**
+ * The wterm element is the one scroller: scrollback above, live grid below, and
+ * any part of a grid taller than the box reachable by the same gesture.
+ */
+function sizeScreen() {
+  const boxH = viewport.clientHeight
+  if (boxH === 0) return
+
+  // Pin the bottom, not the top. When the keyboard opens the window gets
+  // shorter, and holding scrollTop would leave the top of the grid on screen
+  // with pi's input box pushed out of sight underneath.
+  const fromBottom = screen.scrollHeight - screen.scrollTop - screen.clientHeight
+
+  const naturalW = state.cols * state.cell.width
+  // A whole number of rows. wterm scrolls to the bottom by flooring to a row
+  // boundary, so a box that is not a multiple of the row height leaves it parked
+  // short of the end — and once that remainder exceeds its own 5px tolerance it
+  // stops following output at all. The leftover is under a row of background.
+  const rows = Math.floor(boxH / state.cell.height)
+  screen.style.width = `${naturalW}px`
+  screen.style.height = `${rows * state.cell.height}px`
+  stage.style.width = `${naturalW}px`
+  stage.style.height = `${boxH}px`
+
+  screen.scrollTop = screen.scrollHeight - screen.clientHeight - Math.max(0, fromBottom)
+}
+
+// A resize reaches pi as SIGWINCH and makes it repaint, so it waits for the
+// output to stop rather than landing in the middle of one. Our own core is not
+// the reason: it holds a partial sequence across a resize and finishes parsing
+// it afterwards.
+const QUIET_MS = 120
+let lastOutput = 0
+let pendingGrid = null
+
+function setGrid(cols, rows) {
+  pendingGrid = { cols, rows }
+  applyPendingGrid()
+}
+
+function applyPendingGrid() {
+  if (!pendingGrid) return
+  clearTimeout(applyPendingGrid.timer)
+  const since = Date.now() - lastOutput
+  if (since < QUIET_MS) {
+    applyPendingGrid.timer = setTimeout(applyPendingGrid, QUIET_MS - since)
+    return
+  }
+  const { cols, rows } = pendingGrid
+  pendingGrid = null
+  state.wanted = { cols, rows }
+  conn.resize(cols, rows)
+}
+
+/**
+ * Render at the grid the PTY actually has.
+ *
+ * The server owns the PTY and gives it to the narrowest viewer, so what we ask
+ * for and what we get are not always the same. Rendering anything other than
+ * the real grid would mean parsing a relative stream drawn for a different
+ * width, which is wrong in a way that looks like a layout bug.
+ */
+// A grid change is followed by a snapshot that replaces the whole buffer, and
+// the rendered rows are dropped before it arrives. Reading position therefore
+// has to be taken before the resize and put back once wterm has rendered the
+// repaint, which it does on a later frame — but a live stream can keep
+// growing the buffer forever, so this cannot just wait for it to settle. It
+// gives up after a fixed window, and anything that moves the scroll on its
+// own terms — a drag, Top/Bottom, the back-to-live button — cancels it.
+let stopReading = () => {}
+// The share the re-pin in flight is holding the reader at, null when none is.
+let readingShare = null
+
+// How far up the history the eye is, as a share of the whole -- the only
+// measure that survives a reflow, since pixels and rows both change. A re-pin
+// already in flight is the honest answer while one does: a resize landing
+// inside another one's reflow reads the emptied DOM as at-bottom and would
+// abandon the reader on the strength of it. Null means the reader is at the
+// live edge, with nowhere to hold.
+const readingShareNow = () => readingShare ?? (atBottom() || screen.scrollHeight === 0
+  ? null
+  : (screen.scrollHeight - screen.scrollTop - screen.clientHeight) / screen.scrollHeight)
+
+function applyServerSize(cols, rows) {
+  if (cols === state.cols && rows === state.rows) return
+  const share = readingShareNow()
+  state.cols = cols
+  state.rows = rows
+  term.resize(cols, rows)
+  meter?.resize(cols, rows)             // wrapping is width-dependent, so the meter must match
+  sizeScreen()
+  if (share !== null) keepReading(share)
+}
+
+// Long enough for wterm's own repaint to land after a resize; not a promise to
+// hold position against output that is still streaming in.
+const READING_MS = 600
+
+/** Re-apply the position on every frame until the repaint settles or gives up. */
+function keepReading(share) {
+  stopReading() // a newer resize, or the user, cancels whatever was running
+  // After that cancel, never before it: the outgoing re-pin clears both of
+  // these on its way out, and the incoming one needs them set.
+  resettling = true
+  readingShare = share
+  const deadline = performance.now() + READING_MS
+  let last = -1
+  let frames = 0
+  const cancel = () => {
+    // A stale cancel firing after a newer resize has already taken over must
+    // not clear that newer one's ownership — checked, not assumed, because a
+    // resize landing before the next frame calls this twice: once directly,
+    // once from its own step's guard.
+    if (stopReading === cancel) {
+      stopReading = () => {}
+      resettling = false
+      readingShare = null
+    }
+    screen.removeEventListener('pointerdown', cancel)
+    screen.removeEventListener('wheel', cancel)
+  }
+  stopReading = cancel
+  screen.addEventListener('pointerdown', cancel, { passive: true })
+  screen.addEventListener('wheel', cancel, { passive: true })
+  const step = () => {
+    if (stopReading !== cancel || performance.now() > deadline) { cancel(); return }
+    const h = screen.scrollHeight
+    screen.scrollTop = h - screen.clientHeight - share * h
+    toBottom.hidden = atBottom()
+    if (h === last) { if (++frames > 3) { cancel(); return } } else { last = h; frames = 0 }
+    requestAnimationFrame(step)
+  }
+  requestAnimationFrame(step)
+}
+
+function setScale(scale) {
+  const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale))
+  if (next === state.scale) return
+  const share = readingShareNow()
+  state.scale = next
+  state.fontSize = BASE_FONT_SIZE * next
+  state.cell = measureCell(state.fontSize)
+  screen.style.setProperty('--term-font-size', `${state.fontSize}px`)
+  screen.style.setProperty('--term-row-height', `${state.cell.height}px`)
+  term.refreshCellSize()
+  strip.style.flexBasis = `${state.cell.height}px`
+  $('scale-val').textContent = `${Math.round(next * 100)}%`
+  const layout = applyLayout()
+  // Even without a new app height, the scroller has to match the new cell size.
+  if (!layout) sizeScreen()
+  if (share === null) screen.scrollTop = screen.scrollHeight - screen.clientHeight
+  else keepReading(share)
+  fitGrid(layout)
+}
+
+/**
+ * Size the grid to the device, not to the moment. Rows come from the layout
+ * viewport so the keyboard opening never reflows pi; only what is visible
+ * changes.
+ */
+function fitGrid(l = deriveLayout(readViewport())) {
+  // A fit requested without valid geometry waits for a valid, unpanned settle.
+  if (!l) { fitted = null; return }
+  fitted = { width: l.terminal.width, height: l.stableHeight }
+  const { cols, rows } = gridFor(l.terminal.width, l.stableHeight, state.cell)
+  setGrid(cols, rows)
+}
+
+// visualViewport fires a burst during rotation and keyboard animation, and the
+// intermediate values are wrong. Act at once, then again once it settles.
+let settle = null
+// The width and keyboard-down height the grid was last fitted to. A preset
+// leaves the height null: a pick by hand stands until the width changes.
+let fitted = null
+// How many viewport events the burst now settling has had.
+let burst = 0
+
+function onViewportChange(e) {
+  // A burst is logged as the event that began it and where it settled.
+  if (e && settle === null) record(e.type.replace('orientationchange', 'rotate'))
+  if (e) burst++
+  applyLayout()
+  clearTimeout(settle)
+  settle = setTimeout(() => {
+    settle = null
+    rememberKeyboardDown()
+    const l = applyLayout()
+    // Rotating is a deliberate act and landscape is worth ~2x the columns, so
+    // it refits. The keyboard is not deliberate and never touches the grid:
+    // the grid is sized from the keyboard-down layout, which the keyboard does
+    // not change. That layout can still change on its own: Chrome on Android
+    // can come to rest short after a reload and reach full height later. Not
+    // on a panned page, which reads short by the pan (see rememberKeyboardDown).
+    if (l) {
+      const widthChanged = fitted && l.terminal.width !== fitted.width
+      const heightChanged = !fitted || (fitted.height !== null && l.stableHeight !== fitted.height)
+      if (widthChanged || (heightChanged && visualViewport.offsetTop === 0)) fitGrid(l)
+    }
+    record(`settled ${burst}`)
+    burst = 0
+  }, SETTLE_MS)
+}
+
+/**
+ * Coming back from hidden. iOS can change the viewport while the page is
+ * hidden and fire nothing, so the layout is read again. An iOS home-screen app
+ * can also come back panned up for a keyboard that went away while the screen
+ * was off, a WebKit fault that outlasts a blur and a reload. The page never
+ * scrolls by design, so there the pan is put back.
+ */
+function onVisibilityChange() {
+  record(document.hidden ? 'hidden' : 'visible')
+  if (document.hidden) return
+  if (readViewport().standalone && (window.scrollY > 0 || visualViewport.offsetTop > 0)) {
+    window.scrollTo(0, 0)
+    record('unpan')
+  }
+  onViewportChange()
+}
+
+// ---------------------------------------------------------------- scrolling
+
+/**
+ * A row with nothing on it. Blank cells coalesce into one bare `<span>` of
+ * spaces, so anything carrying a class or a style — the cursor, a block glyph
+ * drawn as a background, a coloured run — is content even where its text is
+ * empty.
+ */
+const rowIsBlank = row => !row.textContent.trim() && !row.querySelector('span[class],span[style]')
+
+/**
+ * Hide the empty rows at the foot of the grid, so the scroller ends where the
+ * program stopped writing.
+ *
+ * Everything that means "the bottom" measures the scroller — sizeScreen's pin,
+ * atBottom, and wterm's own follow-output and scroll-on-keystroke, which this
+ * client does not own. Ending its content at the last written row corrects all
+ * of them at once, where a content-aware scroll target here would be undone by
+ * the next keystroke.
+ */
+function trimBlankTail() {
+  const rows = term.renderer.rowEls
+  let cut = rows.length
+  while (cut > 0 && rowIsBlank(rows[cut - 1])) cut--
+  for (let i = 0; i < rows.length; i++) {
+    const blank = i >= cut
+    if (rows[i].hidden !== blank) rows[i].hidden = blank
+  }
+}
+
+// wterm owns sticking to the bottom: it checks the position before each write,
+// re-pins after rendering, and jumps back on a keystroke. onScroll's
+// at-bottom branch decides live-vs-held (and drives the way-back button), and
+// uses wterm's own tolerance so the two cannot disagree about whether you are
+// on the live screen.
+const AT_BOTTOM_PX = 5
+const atBottom = () => screen.scrollHeight - screen.scrollTop - screen.clientHeight < AT_BOTTOM_PX
+
+// Reading beats liveness. Output that arrives while the reader is up in
+// history is held back rather than rendered under them: a new line shifts
+// every visible row up one, including rows under the reader's eye, so a
+// flowing stream moves the page the reader is on. Holding pauses the terminal
+// rather than corrupting it: bytes replay in order the moment the reader
+// returns to the bottom, and the button that offers the way back counts what
+// is waiting.
+const HELD_MAX = 4 * 1024 * 1024
+const TO_BOTTOM_LABEL = toBottom.textContent
+const held = []
+let heldBytes = 0
+// True across a resize's reflow: term.resize empties the rendered rows, so
+// for one turn the scroller is "at the bottom" by geometry alone, and output
+// or a flush acting on that would change content under a parked reader. Set
+// by keepReading, cleared when its re-pin settles or gives up.
+let resettling = false
+// An honest "N new" needs a terminal, not byte arithmetic: a repainting
+// program emits a newline per rewritten row while scrolling nothing, and
+// wrapping emits none while scrolling plenty. A second core, fed the held
+// bytes out-of-band, scrolls for real — its scrollback count IS the rows the
+// stream would have pushed past the eye. That count pins at the meter's own
+// 1000-line cap;
+// "1000+" is all a reader that far behind needs to know.
+let meter = null
+const ED3 = new Uint8Array([0x1b, 0x5b, 0x33, 0x4a])
+
+const labelHeld = () => {
+  const n = meter.getScrollbackCount()
+  toBottom.textContent = n >= 1000 ? '↓ 1000+ new' : `↓ ${n} new`
+}
+// The client sends size with its handshake and the server answers with a
+// snapshot — and it sends the pair again on resize and folder switch, with
+// no connection-state transition to watch for. So a size report is the one
+// reliable "snapshot next" signal for this client, and the first output
+// after one bypasses the hold: queued behind a parked reader it would leave
+// them looking at a stale screen, and at the ring cap it would wipe their
+// history on return.
+let snapshotPending = false
+
+// The snapshot is not the whole re-send. On a resize, pi's own redraw of the
+// transcript trails it: the server serializes the mirror the moment the PTY
+// changes, and the repaint arrives afterwards as ordinary output,
+// indistinguishable frame-for-frame from new lines. For a reader at the
+// bottom that lands live and heals; for one parked in history the hold would
+// keep it off for good, leaving them on a layout the grid has already left.
+// So for a short window after a snapshot, output writes through and the
+// reader is held by the share pin instead of by the hold: the redraw is the
+// same history re-wrapped, and the pin keeps their line under the eye while
+// it lands.
+const SNAPSHOT_TAIL_MS = 2000
+let snapshotTail = 0
+
+const pinReader = () => {
+  const share = readingShareNow()
+  if (share !== null) keepReading(share)
+}
+
+function flushHeld() {
+  if (!held.length) return
+  // Shift-per-write, not splice-then-write: a write that throws mid-replay
+  // costs the rest of the queue, not the whole of it — and the finally puts
+  // the label and the pending grid back whatever happened.
+  try {
+    while (held.length) {
+      const bytes = held.shift()
+      heldBytes -= bytes.length
+      term.write(bytes)
+    }
+  } finally {
+    meter.writeRaw(ED3)               // scrollback count back to zero
+    toBottom.textContent = TO_BOTTOM_LABEL
+    applyPendingGrid()
+  }
+}
+
+/** The hold is dropped, not flushed, on a disconnect: the reconnect snapshot supersedes it. */
+function dropHeld() {
+  held.length = 0
+  heldBytes = 0
+  meter.writeRaw(ED3)
+  toBottom.textContent = TO_BOTTOM_LABEL
+  // A dropped hold rides a PTY reset or a view wipe: the field mirror's line
+  // no longer exists, so the next diff must start from an empty field.
+  term.input?.resetMirror()
+}
+
+function deliver(bytes) {
+  if (snapshotPending) {
+    snapshotPending = false
+    const share = readingShareNow()
+    // Everything being held is already inside the snapshot: the server writes
+    // its mirror the same bytes it sends us, and serializes it at a boundary
+    // behind them. Replaying the hold on top would apply it twice -- history
+    // gaining lines that were only ever produced once. What is not inside it
+    // -- pi's redraw on a resize -- follows as ordinary output, and the tail
+    // window below writes it through.
+    dropHeld()
+    snapshotTail = share === null ? 0 : performance.now() + SNAPSHOT_TAIL_MS
+    term.write(bytes)
+    applyPendingGrid()
+    if (share !== null) pinReader()
+    // The snapshot reset the core, so the rendered window's keys no longer
+    // match the fresh core's counts and the next render redraws it wholesale.
+    return
+  }
+  if (performance.now() < snapshotTail) {
+    // Inside the tail window the reader is pinned, not protected. The share
+    // is read fresh on each write, so one who scrolled mid-window is held
+    // where they moved to, and keepReading's cancel-on-touch still applies.
+    // A reader at the live edge has no share, and this is just the live path.
+    term.write(bytes)
+    applyPendingGrid()
+    pinReader()
+    return
+  }
+  // The scroll event normally flushes on return to the bottom, but its
+  // dispatch can trail the next chunk, and replay order must not depend on
+  // that race: whatever is held goes first, always. A resize in flight
+  // suspends the at-bottom verdict entirely (see `resettling`).
+  const live = atBottom() && !resettling
+  if (held.length && live) flushHeld()
+  if (live) { term.write(bytes); applyPendingGrid(); return }
+  held.push(bytes)
+  heldBytes += bytes.length
+  meter.writeRaw(bytes)
+  // Past the cap this is a memory valve, nothing more: the replay lands under
+  // wterm's own follow/compensation logic, which keeps the reader's line put,
+  // and the hold resumes with the next chunk. A reader this far ahead of the
+  // stream is not reading.
+  if (heldBytes > HELD_MAX) flushHeld()
+  else labelHeld()
+}
+
+function onScroll() {
+  const bottom = atBottom() && !resettling
+  toBottom.hidden = bottom
+  if (bottom) {
+    // Landing on the bottom is the reader asking for live again. wterm's own
+    // scroll handler clears its follow-output latch on every scroll it does
+    // not recognize as its own -- a programmatic jump lands there, since the
+    // direct scrollTop write cannot match wterm's programmatic-pin sentinel --
+    // and once the latch is down, rotation compensation at a saturated ring
+    // walks the box off the bottom a row at a time, silently holding live
+    // output. Re-assert the latch so follow-output wins over compensation.
+    term.followOutput(true)
+    flushHeld()
+  }
+}
+
+// ---------------------------------------------------------------- key bar
+
+// For a letter key, meta is just an ESC prefix, so `esc` then `b` is
+// byte-identical to alt+b and there would be nothing this button adds. Arrows
+// are the exception: alt+Up is one CSI sequence with a modifier parameter
+// (\e[1;3A), not reproducible by sending esc and Up separately — those stay
+// two unrelated sequences, and esc alone is a real keystroke on its own (it
+// aborts the current task), not a modifier waiting to be paired.
+const BAR = [
+  { label: '⌃', mod: 'ctrl' },
+  { label: '⇧', mod: 'shift' },
+  { label: '⌥', mod: 'alt' },
+  { label: 'esc', key: 'Escape' },
+  { label: '⇥', key: 'Tab' },
+  // The bar's ⌫ carries its own repeat timer: iOS repeats deletions natively
+  // only through input events on the field, which the field-mirror diff
+  // already services -- the bar is for when the field is empty or the
+  // keyboard's repeat has run out of line.
+  { label: '⌫', key: 'Backspace', repeat: true },
+  { label: '⏎', key: 'Enter' },
+  { label: '↑↓', name: 'arrow pad', cls: 'wide', act: togglePad },
+  { label: '⌨', name: 'keyboard', cls: 'wide', release: toggleKeyboard },
+  { label: '≡', name: 'menu', act: openMenu },
+]
+
+// The arrows live in a pad that pops over the terminal rather than on the bar:
+// four more keys squeeze every button under a thumb's width, and Enter needs
+// the room more. The pad stays open across presses -- walking a pi menu is an
+// arrow per step -- and an armed ⌃/⇧/⌥ on the bar reaches its keys like any
+// other.
+const PAD = [
+  // Page up/down lead the pad: the terminal is a few screens tall at most on
+  // a phone, so the page step is the everyday move and the arrows finish it.
+  // Paired arrows for a page of distance, single arrows for a row.
+  { label: '⇈', key: 'PageUp', repeat: true },
+  { label: '⇊', key: 'PageDown', repeat: true },
+  { label: '←', key: 'Left', repeat: true },
+  { label: '↓', key: 'Down', repeat: true },
+  { label: '↑', key: 'Up', repeat: true },
+  { label: '→', key: 'Right', repeat: true },
+]
+
+const terminalInput = () => term.input.textarea
+
+// A bar key must not dismiss the keyboard. iOS ends editing when DOM focus
+// leaves the textarea, and a tap's default activation would move focus to the
+// button. Bar buttons are non-focusable and their press is prevented, so focus
+// never leaves the input and the keyboard stays up.
+
+/** The app's own close-the-keyboard buttons blur the input, deliberately. */
+function dismissKeyboard() {
+  const input = terminalInput()
+  if (document.activeElement === input) input.blur()
+}
+
+// Set when the keyboard key asks for the keyboard, cleared once the viewport
+// shows it or the input loses focus. Still set means a keyboard the viewport
+// cannot see -- an iPad's floating one, a hardware keyboard's bar -- or one
+// still on its way up, and either way the next press puts it away.
+let awaitingKeyboard = false
+
+/**
+ * Summon or dismiss the software keyboard without having to find something to
+ * tap. Runs on the key's release: a focus only opens the keyboard inside a
+ * user gesture, and Chrome on Android counts a touch as one from its pointerup,
+ * so on a freshly loaded page, before any pointerup, a focus on pointerdown
+ * shows nothing.
+ */
+function toggleKeyboard() {
+  const input = terminalInput()
+  if (document.activeElement === input && (deriveLayout(readViewport())?.keyboardUp || awaitingKeyboard)) {
+    record('key down')
+    return dismissKeyboard()
+  }
+  record('key up')
+  // Focus alone does not mean a keyboard: the input is focused with none
+  // after a fresh load, and after Android's Back hides it without a blur.
+  // Focusing it again then does nothing; blurring first makes it a fresh
+  // focus, which brings the keyboard up.
+  input.blur()
+  term.focus()
+  awaitingKeyboard = true
+}
+
+/** Pop the arrow pad over the terminal, or away again. */
+function showPad(open) {
+  pad.hidden = !open
+  const toggle = keys.querySelector('button[name="arrow pad"]')
+  toggle.classList.toggle('sticky', open)
+  toggle.setAttribute('aria-expanded', String(open))
+}
+
+function togglePad() { showPad(pad.hidden) }
+
+// A tap outside the pad and the bar dismisses it. A bar press does not: an
+// armed ⌃/⇧/⌥ on the bar is how a modified arrow gets sent, so the pad stays
+// up while the modifier is armed.
+document.addEventListener('pointerdown', e => {
+  if (!pad.hidden && !e.target.closest('#pad, #keys')) showPad(false)
+})
+
+/** The keyboard would cover most of the menu, so it goes away first. */
+/** Show the readout instead of the menu, or the menu instead of the readout. */
+function foldDiag(open) {
+  $('diag').hidden = !open
+  $('menu-main').hidden = open
+  $('diag-caret').textContent = open ? '▾' : '▸'
+}
+
+function hideMenu() {
+  retryPicker = null
+  menu.hidden = true
+}
+
+function openMenu({ preserveNotice = false } = {}) {
+  poolPickerRequest++
+  menuView = 'normal'
+  dismissKeyboard()
+  // The pad would cover the sheet the same way the keyboard does.
+  showPad(false)
+  // Always on the ordinary view: the menu is mostly the session list now, and
+  // opening into last time's diagnostics would be a puzzle.
+  foldDiag(false)
+  // Asked for on the way in rather than held from last time: pi is used from
+  // other terminals too, so the list goes stale between openings.
+  refreshPlaces({ preserveNotice }).catch(() => {})
+  menu.hidden = false
+}
+
+// ---------------------------------------------------------------- sessions
+
+/**
+ * Every session pi has a transcript for, as the server found them: running
+ * ones first and then newest first, since which folder they
+ * are in matters less on a phone than how recently you touched them.
+ *
+ * Joining one never ends another: sessions keep running once left, so a row
+ * acts the moment it is tapped rather than asking for a second confirming tap
+ * the way ending a program used to need.
+ */
+function placePath(sess) {
+  const path = document.createElement('span')
+  path.className = 'place-path'
+  const details = document.createElement('span')
+  details.className = 'place-path-text'
+  details.textContent = `${sess.path} · ${ago(sess.at)}`
+  path.append(details)
+  if (sess.viewers >= 1) {
+    const viewers = document.createElement('span')
+    viewers.className = 'place-watchers'
+    viewers.textContent = `${sess.viewers} watching`
+    path.append(viewers)
+  }
+  return path
+}
+
+function showPlaces({ sessions, more, offset, here, kinds }) {
+  const active = currentPlace?.processId && sessions.find(s => s.processId === currentPlace.processId)
+  if (active) {
+    currentPlace = active
+    placeNow.textContent = active.path
+  }
+  places.textContent = ''
+
+  // The ways to be somewhere with no transcript yet: a fresh pi, or a plain
+  // terminal, whichever this server offers.
+  const starts = [['pi', '+ New pi session'], ['shell', '+ New terminal']]
+    .filter(([kind]) => kinds.includes(kind))
+  if (starts.length) {
+    const row = document.createElement('div')
+    row.className = 'place-starts'
+    for (const [kind, label] of starts) {
+      const start = document.createElement('button')
+      start.className = 'place start'
+      const name = document.createElement('span')
+      name.className = 'place-name'
+      name.textContent = label
+      start.append(name)
+      start.addEventListener('click', () => showDirs({ sessions, here, kind }))
+      row.append(start)
+    }
+    places.append(row)
+  }
+
+  for (const sess of sessions) places.append(sessionRow(sess))
+  showMore({ more, offset }, sessions)
+}
+
+/** What a running session's marker says: it is working, or stopped while nobody watched. */
+const markOf = sess => sess.working ? 'working' : sess.unread ? 'unread' : null
+
+/** Every running row has a marker; one that is neither working nor unread is
+ *  just running. The spoken word sits outside the name, which stays the label,
+ *  so this goes on the row before the name does. */
+function markRunning(row, sess) {
+  const mark = markOf(sess) ?? 'running'
+  row.classList.add('running', mark)
+  row.append(srOnly(`${mark} `))
+}
+
+function srOnly(text) {
+  const hidden = document.createElement('span')
+  hidden.className = 'sr-only'
+  hidden.textContent = text
+  return hidden
+}
+
+/** One session row, for the list and for every page appended under it. */
+function sessionRow(sess) {
+  const wrap = document.createElement('div')
+  wrap.className = 'place-row'
+  wrap.dataset.sessionId = sess.id
+  if (sess.running) wrap.classList.add('has-end')
+
+  const row = document.createElement('button')
+  row.className = samePlace(sess, currentPlace) ? 'place here' : 'place'
+  if (sess.running) markRunning(row, sess)
+
+  const name = document.createElement('span')
+  name.className = 'place-name'
+  // pi names a session once it has read the first exchange; before that,
+  // the label is whatever was first asked, so the row is never bare.
+  name.append(sess.label)
+  row.append(name, placePath(sess))
+  row.addEventListener('click', () => joinSession(sess))
+  wrap.append(row)
+
+  // Keep the destructive action separate from the join button so it remains
+  // keyboard-accessible without nesting interactive controls.
+  if (sess.running) {
+    const end = document.createElement('button')
+    end.className = 'place-end'
+    end.dataset.processId = sess.processId
+    end.dataset.label = sess.label
+    end.addEventListener('click', () => {
+      if (armedEndId !== sess.processId) {
+        armEnd(sess.processId)
+        return
+      }
+      clearEndArm()
+      void endSession(sess)
+    })
+    updateEndControl(sess.processId, end)
+    wrap.append(end)
+  }
+  return wrap
+}
+
+/**
+ * Each tap extends the prefix of the ranking fetched so far. Sessions can
+ * move upward as transcripts are written; rereading the prefix includes those
+ * rows instead of skipping them between offset windows. Already shown rows
+ * are not drawn twice.
+ */
+function showMore({ more: hasMore, offset }, shown) {
+  if (!hasMore) return
+  const more = document.createElement('button')
+  more.className = 'place-more'
+  more.textContent = 'show older'
+  more.addEventListener('click', async () => {
+    more.disabled = true
+    more.textContent = 'loading…'
+    const request = placesRequest
+    let data
+    try {
+      data = await fetchPlaces({ limit: offset + MENU_PAGE })
+    } catch {
+      if (request !== placesRequest || !more.isConnected) return
+      showMenuNotice('could not load older sessions')
+      more.disabled = false
+      more.textContent = 'show older'
+      return
+    }
+    if (request !== placesRequest || !more.isConnected) return
+    more.remove()
+    const fresh = data.sessions.filter(sess => !shown.some(old => samePlace(sess, old)))
+    for (const sess of fresh) places.append(sessionRow(sess))
+    showMore(data, [...shown, ...fresh])
+  })
+  places.append(more)
+}
+
+function updateEndControl(id, existing) {
+  const control = existing ?? [...places.querySelectorAll('.place-end')]
+    .find(button => button.dataset.processId === id)
+  if (!control) return
+  const ending = endingIds.has(id)
+  const armed = armedEndId === id
+  control.disabled = ending
+  control.textContent = ending ? 'Ending…' : armed ? 'End it?' : 'End'
+  control.classList.toggle('confirm', armed && !ending)
+  control.setAttribute('aria-label', `${ending ? 'ending' : armed ? 'confirm ending' : 'end'} ${control.dataset.label}`)
+}
+
+function clearEndArm() {
+  if (endArmTimer !== null) clearTimeout(endArmTimer)
+  endArmTimer = null
+  armedEndId = null
+}
+
+function armEnd(id) {
+  const previous = armedEndId
+  clearEndArm()
+  if (previous !== null && previous !== id) updateEndControl(previous)
+  armedEndId = id
+  updateEndControl(id)
+  endArmTimer = setTimeout(() => {
+    if (armedEndId !== id) return
+    armedEndId = null
+    endArmTimer = null
+    updateEndControl(id)
+  }, 4_000)
+}
+
+/** End a running PTY, then refresh the place list and the tabs. Answers whether the
+ *  terminal is gone, which is all the full-pool picker can go on. */
+async function endSession(sess) {
+  let gone = false
+  endingIds.add(sess.processId)
+  updateEndControl(sess.processId)
+  try {
+    const res = await fetch(`/terminal?process=${encodeURIComponent(sess.processId)}`, { method: 'DELETE' })
+    gone = res.ok || res.status === 404
+    if (!res.ok && res.status !== 404) $('menu-state').textContent = `End failed (${res.status})`
+  } catch {
+    $('menu-state').textContent = 'End failed'
+  } finally {
+    // Settled either way: a failed end must not read as "this viewer ended
+    // it" if someone else gets the session killed for real a moment later.
+    endingIds.delete(sess.processId)
+    updateEndControl(sess.processId)
+    refreshPlaces().catch(() => {})
+    if (tabsEnabled) refreshTabs()
+  }
+  return gone
+}
+
+/**
+ * The pool is full: say what the server said, offer one row per running
+ * session to end, in the order the server picked, and do the refused action
+ * again once one of them is gone. Two taps to end, the same as the End
+ * control on a list row. Cancel goes back to the ordinary menu.
+ */
+async function showPoolFull(attempt, retry) {
+  const request = ++poolPickerRequest
+  let running
+  try {
+    running = (await fetchPlaces({ running: true })).sessions
+  } catch (error) {
+    if (request !== poolPickerRequest) return
+    openMenu({ preserveNotice: true })
+    showMenuNotice(error.message)
+    return
+  }
+  if (request !== poolPickerRequest) return
+  clearEndArm()
+  openMenu({ preserveNotice: true })
+  // The ordinary list must not draw over the picker while the menu is open.
+  menuView = 'pick'
+  places.textContent = ''
+  const picker = {}
+  retryPicker = picker
+  const cancel = document.createElement('button')
+  cancel.className = 'place dir'
+  cancel.textContent = '‹ Cancel'
+  cancel.addEventListener('click', () => { retryPicker = null; openMenu() })
+  places.append(cancel)
+
+  const heading = document.createElement('div')
+  heading.className = 'place-heading pool'
+  heading.textContent = running.length
+    ? `Limit reached (${running.length} running). End one and ${attempt}.`
+    : 'Limit reached. Nothing is running to end.'
+  places.append(heading)
+
+  for (const sess of running) {
+    const tap = async () => {
+      if (armedEndId !== sess.processId) return armEnd(sess.processId)
+      clearEndArm()
+      if (await endSession(sess) && retryPicker === picker) {
+        retryPicker = null
+        await retry()
+      }
+    }
+    const wrap = document.createElement('div')
+    wrap.className = 'place-row has-end'
+
+    const row = document.createElement('button')
+    row.className = 'place'
+    markRunning(row, sess)
+    const name = document.createElement('span')
+    name.className = 'place-name'
+    name.textContent = sess.label
+    // What the row's `at` says is when the transcript was touched; the picker
+    // is ordered by the last sign of work anywhere in the session.
+    row.append(name, placePath({ ...sess, at: sess.active }))
+    row.addEventListener('click', tap)
+
+    const end = document.createElement('button')
+    end.className = 'place-end'
+    end.dataset.processId = sess.processId
+    end.dataset.label = sess.label
+    end.addEventListener('click', tap)
+    updateEndControl(sess.processId, end)
+    wrap.append(row, end)
+    places.append(wrap)
+  }
+
+  if (!running.length) menuView = 'normal'
+}
+
+/** `3m`, `2h`, `5d`: file mtime is when the session was last active. */
+const ago = at => {
+  if (!at) return ''
+  const s = Math.max(0, (Date.now() - at) / 1000)
+  if (s < 60) return 'now'
+  if (s < 3600) return `${s / 60 | 0}m`
+  if (s < 86400) return `${s / 3600 | 0}h`
+  return `${s / 86400 | 0}d`
+}
+
+/**
+ * Where a brand-new session can go. The server's own folder comes first and
+ * is the one chosen by just tapping through; the rest are the folders pi
+ * already runs in. Anything else is a walk through the folders on disk.
+ * `kind` is what the session runs, `pi` or `shell`.
+ */
+function showDirs({ sessions, here, kind }) {
+  places.textContent = ''
+
+  const back = document.createElement('button')
+  back.className = 'place dir'
+  back.textContent = '‹ Back'
+  back.addEventListener('click', () => refreshPlaces().catch(() => {}))
+  places.append(back)
+
+  const heading = document.createElement('div')
+  heading.className = 'place-heading'
+  heading.textContent = `New ${kind === 'pi' ? 'pi session' : 'terminal'} in:`
+  places.append(heading)
+
+  const dirs = [...new Set([here, ...sessions.map(s => s.cwd)])]
+  const appendDir = dir => {
+    const row = document.createElement('button')
+    row.className = 'place dir'
+    const name = document.createElement('span')
+    name.className = 'place-name'
+    name.textContent = basename(dir)
+    const path = document.createElement('span')
+    path.className = 'place-path'
+    path.textContent = dir === here ? 'this folder' : ''
+    row.append(name, path)
+    row.addEventListener('click', () => startSession(dir, kind))
+    places.append(row)
+  }
+  appendDir(dirs[0])
+
+  const row = document.createElement('button')
+  row.className = 'place dir'
+  const name = document.createElement('span')
+  name.className = 'place-name'
+  name.textContent = 'Navigate to folder…'
+  row.append(name)
+  row.addEventListener('click', () => walkSession(here, kind))
+  places.append(row)
+  for (const dir of dirs.slice(1)) appendDir(dir)
+}
+
+/**
+ * Where a fresh session can go when none of the folders above is it: the
+ * folders inside this one, a row at a time. Tapping a name walks in, the
+ * parent row walks out, and the first row starts a session where the walk is.
+ */
+async function walkSession(cwd, kind) {
+  places.textContent = ''
+
+  const back = document.createElement('button')
+  back.className = 'place dir'
+  back.textContent = '‹ Back'
+  back.addEventListener('click', () => refreshPlaces().catch(() => {}))
+  places.append(back)
+
+  const res = await fetch(`/subfolders?cwd=${encodeURIComponent(cwd)}`)
+  if (!res.ok) {
+    clearMenuNotice()
+    showMenuNotice((await res.text()) || 'could not read that folder')
+    return
+  }
+  const listing = await res.json()
+
+  const row = (title, text, onOpen) => {
+    const button = document.createElement('button')
+    button.className = 'place dir'
+    const name = document.createElement('span')
+    name.className = 'place-name'
+    name.textContent = title
+    const path = document.createElement('span')
+    path.className = 'place-path'
+    path.textContent = text
+    button.append(name, path)
+    button.addEventListener('click', onOpen)
+    places.append(button)
+  }
+
+  row(`Start ${kind === 'pi' ? 'pi' : 'terminal'} here`, listing.cwd, () => startSession(listing.cwd, kind))
+  if (listing.parent) row(`↰ ${basename(listing.parent)}`, listing.parent, () => walkSession(listing.parent, kind))
+  for (const dir of listing.dirs) row(basename(dir), '', () => walkSession(dir, kind))
+}
+
+/** Ask the server to begin a fresh session of `kind` in `dir`, then join it. */
+async function startSession(dir, kind) {
+  const res = await fetch('/start', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cwd: dir, kind }),
+  })
+  if (res.status === 409) return showPoolFull(`your new ${kind === 'pi' ? 'pi session' : 'terminal'} in ${basename(dir)} starts`, () => startSession(dir, kind))
+  if (!res.ok) return showMenuNotice(await res.text().catch(() => 'could not start a session'))
+  const { id, cwd, processId } = await res.json()
+  // Name and path come from the PROCESS frame that follows, which is the one
+  // formatting of a folder the header and the menu agree on.
+  joinSession({ id, cwd, processId })
+  // The list is stale the moment this worked: a row now exists for a session
+  // with no transcript.
+  refreshPlaces().catch(() => {})
+}
+
+/** Point the connection at another session's socket and reconnect to it. */
+function joinSession(sess) {
+  poolPickerRequest++
+  selectionVersion++
+  clearEndArm()
+  clearMenuNotice()
+  // Reaching a session is the end of the picker that asked for it.
+  menuView = 'normal'
+  pendingPlace = sess
+  const url = sessionUrl(sess)
+  if (conn.started) conn.join(url)
+  else {
+    conn.url = url
+    conn.connect({ cols: state.wanted.cols, rows: state.wanted.rows })
+  }
+  hideMenu()
+}
+
+/**
+ * Apply a sticky modifier to a key from the software keyboard. Those arrive
+ * through wterm rather than the key bar, so without this `⌃` then `c` sends a
+ * bare `c` and Ctrl-C is unreachable. Only single characters qualify — a paste
+ * or a dictated phrase is not a chord.
+ */
+function withMods(data) {
+  // Diff-transmitted bytes are the field's own content, not a user chord:
+  // consuming an armed modifier here would rewrite them (⌥+DEL becomes a
+  // kill-word) and desynchronize the mirror. Keydown-sent keystrokes --
+  // where a sticky modifier is the whole point -- still pass through.
+  if (term.input?.inFlush) return data
+  return modChord(data) ?? data
+}
+
+/**
+ * The chord the armed modifiers make of one typed key, or null when no Ctrl or
+ * Alt is armed. Also wterm's keyChord hook: Gboard's keydowns are keyCode 229,
+ * so its letters reach wterm only as one-character changes to the field, which
+ * wterm offers here before transmitting them.
+ */
+function modChord(key) {
+  if (key.length !== 1) return null
+  const { ctrl, alt, shift } = state.mods
+  // Any single key consumes the modifiers, including a lone shift the OS
+  // keyboard already applied — otherwise it stays lit and silently lands on
+  // whatever bar key comes next.
+  clearMods()
+  if (!(ctrl || alt)) return null
+  return keySequence(key, { ctrl, alt, shift })
+}
+
+function sendKey(name) {
+  const { ctrl, alt, shift } = state.mods
+  // The bar exists before the WASM core finishes loading, and DECCKM is reset
+  // by definition until an app sets it — so normal-mode CSI is the answer, not
+  // a crash on an early tap.
+  const cursorKeysApp = term.bridge?.cursorKeysApp() ?? false
+  conn.send(keySequence(name, { ctrl, alt, shift, cursorKeysApp }))
+  // Everything a bar key sends either changes or consumes the PTY's line, so
+  // the field mirror goes.
+  term.input?.resetMirror()
+  clearMods()
+}
+
+function clearMods() {
+  for (const m of Object.keys(state.mods)) state.mods[m] = false
+  // Only the modifier keys carry the highlight. `toggle(cls, undefined)` flips
+  // rather than removes, so touching the others lit up half the bar.
+  for (const b of keys.children) if (b.dataset.mod) b.classList.remove('sticky')
+}
+
+/** One bar or pad key, with the press plumbing that keeps the keyboard up. */
+function keyButton(item) {
+  const b = document.createElement('button')
+  b.textContent = item.label
+  b.setAttribute('aria-label', item.name ?? item.key ?? item.mod)
+  if (item.name) b.name = item.name
+  if (item.act === togglePad) {
+    // The pad's toggle also reports its state to screen readers.
+    b.setAttribute('aria-controls', 'pad')
+    b.setAttribute('aria-expanded', 'false')
+  }
+  if (item.label.length > 1) b.classList.add('word')
+  if (item.cls) b.classList.add(item.cls)
+  // Keeps the terminal's textarea focused. A tap's default activation would
+  // move DOM focus to this (focusable) button, and iOS ends editing whenever
+  // focus leaves the editable input — that blur is what dismisses the
+  // keyboard. So the button drops out of tab order (tabindex=-1) and its
+  // default press/click is cancelled, which leaves the textarea focused
+  // through the whole gesture.
+  b.tabIndex = -1
+  b.addEventListener('pointerdown', e => e.preventDefault())
+  b.addEventListener('touchstart', e => e.preventDefault(), { passive: false })
+  if (item.mod) {
+    b.dataset.mod = item.mod
+    b.addEventListener('pointerdown', () => {
+      state.mods[item.mod] = !state.mods[item.mod]
+      b.classList.toggle('sticky', state.mods[item.mod])
+    })
+  } else if (item.release) {
+    // Only the release of a press that began on this key counts, not one that
+    // slid in from the terminal or another finger's. A press that leaves the
+    // key is dropped, as bindRepeat's are; a touch never does (the key holds
+    // it until it lifts), so a touch fires wherever it lifts.
+    let pressing = null
+    b.addEventListener('pointerdown', e => { pressing = e.pointerId })
+    for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) {
+      b.addEventListener(ev, e => {
+        if (e.pointerId !== pressing) return
+        pressing = null
+        if (ev === 'pointerup') item.release()
+      })
+    }
+  } else {
+    bindRepeat(b, item.act ?? (() => sendKey(item.key)), item.repeat)
+  }
+  return b
+}
+
+function buildKeys() {
+  for (const item of BAR) keys.appendChild(keyButton(item))
+  for (const item of PAD) pad.appendChild(keyButton(item))
+}
+
+/** Fire on press, and for navigation keys keep firing while held. */
+function bindRepeat(btn, fire, repeat) {
+  let delay, timer
+  const stop = () => { clearTimeout(delay); clearInterval(timer) }
+  btn.addEventListener('pointerdown', e => {
+    e.preventDefault()
+    fire()
+    if (repeat) delay = setTimeout(() => { timer = setInterval(fire, REPEAT_EVERY_MS) }, REPEAT_AFTER_MS)
+  })
+  for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) btn.addEventListener(ev, stop)
+}
+
+// ---------------------------------------------------------------- diagnostics
+
+/**
+ * A phone shows no stack trace, so a client that dies during startup looks like
+ * missing chrome or scrolling that will not scroll — symptoms with no visible
+ * cause. Put the error on the screen instead.
+ */
+function reportFatal(what) {
+  const overlay = $('diag-overlay')
+  if (!overlay) return
+  let detail
+  try { detail = diagnosticText() } catch (e) { detail = `diagnostics failed: ${e}` }
+  overlay.textContent = `ERROR — ${what}\n\n${detail}`
+  overlay.hidden = false
+}
+
+window.addEventListener('error', e => reportFatal(`${e.message} @ ${e.lineno}:${e.colno}`))
+window.addEventListener('unhandledrejection', e => reportFatal(`unhandled: ${e.reason?.message ?? e.reason}`))
+
+/** On-device readout. The emulator cannot report insets or a real keyboard. */
+function diagnosticText() {
+  const s = readViewport()
+  const l = deriveLayout(s)
+  const b = term.bridge
+  const sb = b ? `${b.getScrollbackCount()} rows` : 'no core'
+  return [
+    `build    ${BUILD_ID}   standalone ${s.standalone}`,
+    `inner    ${s.innerWidth}x${s.innerHeight}   visual ${Math.round(s.visualWidth)}x${Math.round(s.visualHeight)} @${s.offsetTop}`,
+    `insets   t${s.insetTop} r${s.insetRight} b${s.insetBottom} l${s.insetLeft}`,
+    l ? `keyboard ${l.keyboardHeight} (up ${l.keyboardUp})   ${l.orientation}` : 'keyboard unknown (invalid visual height)',
+    `bar      ${l ? `${l.keyBarHeight} (pad ${l.keyBarPadBottom})  ` : ''}rect ${JSON.stringify(bar.getBoundingClientRect().toJSON().top)}..${Math.round(bar.getBoundingClientRect().bottom)}`,
+    `app      ${Math.round(app.getBoundingClientRect().top)}..${Math.round(app.getBoundingClientRect().bottom)}  screen ${window.screen.width}x${window.screen.height}`,
+    `grid     ${state.cols}x${state.rows} cell ${state.cell.width.toFixed(2)}x${state.cell.height} wtermRow ${term._rowHeight} scale ${state.scale}`,
+    `strip    ${footerText ?? 'off'}`,
+    l && `term     ${Math.round(l.terminal.width)}x${Math.round(l.terminal.height)}  stable ${Math.round(l.stableHeight)}`,
+    `scroll   top ${screen.scrollTop} of ${screen.scrollHeight} in ${screen.clientHeight}`,
+    `sb       ${sb}   domRows ${screen.querySelectorAll('.term-row:not([hidden])').length}   held ${heldBytes}B`,
+    `overflow ${getComputedStyle(screen).overflowY}   class ${screen.className}`,
+  ].filter(Boolean).join('\n')
+}
+
+// What the viewport reported around recent events. A layout glitch only shows
+// after the moment that caused it, and opening the menu to read the numbers
+// puts the keyboard away, so the lead-up has to be on record already.
+const LOG_MAX = 50
+const layoutLog = []
+let lastReading = ''
+
+const viewportReading = () =>
+  `in${window.innerHeight} vv${Math.round(visualViewport.height)}@${Math.round(visualViewport.offsetTop)} y${Math.round(window.scrollY)}`
+
+function record(what) {
+  lastReading = viewportReading()
+  const flags = (document.activeElement === terminalInput() ? 'F' : '-') +
+    (document.hasFocus() ? 'W' : '-') + (document.hidden ? 'H' : 'V')
+  const time = new Date().toTimeString().slice(0, 8)
+  layoutLog.unshift(`${time} ${what.padEnd(10)} ${lastReading} app${parseInt(app.style.height)} ${flags}`)
+  layoutLog.length = Math.min(layoutLog.length, LOG_MAX)
+}
+
+function showDiagnostics() {
+  $('diag').textContent = [
+    diagnosticText(),
+    '',
+    'newest first. settled N: after N viewport events',
+    'poll: the readings changed with no event',
+    'F field focused, W window focused, V visible',
+    ...layoutLog,
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------- menu
+
+function buildMenu() {
+  const presets = $('presets')
+  tabsEnabled = localStorage.getItem('afield-tabs') === 'on'
+  const tabsToggle = $('tabs-toggle')
+  const updateTabsToggle = () => {
+    tabsToggle.textContent = `Tabs: ${tabsEnabled ? 'on' : 'off'}`
+    tabsToggle.setAttribute('aria-pressed', String(tabsEnabled))
+  }
+  updateTabsToggle()
+  for (const [c, r] of PRESETS) {
+    const b = document.createElement('button')
+    b.textContent = `${c}×${r}`
+    // Recorded so a settle still pending, the startup's if the pick comes that
+    // early, sees no turn and leaves the pick alone.
+    b.addEventListener('click', () => {
+      fitted = { width: horizontalLayout(readViewport()).width, height: null }
+      setGrid(c, r)
+    })
+    presets.appendChild(b)
+  }
+  const fit = document.createElement('button')
+  fit.textContent = 'Fit'
+  // Wrapped, not passed directly: a listener is handed the click event, which
+  // would arrive as the layout argument and throw on l.terminal.
+  fit.addEventListener('click', () => fitGrid())
+  presets.appendChild(fit)
+
+  // The theme lives with the grid controls: it is a look choice, and sharing
+  // the row keeps the sheet short enough to stay on screen over a terminal.
+  const THEMES = {
+    dark: { className: 'theme-dark', color: '#0b0b0d' },
+    light: { className: 'theme-light', color: '#fafafa' },
+  }
+  for (const name of Object.keys(THEMES)) {
+    const b = document.createElement('button')
+    b.textContent = name[0].toUpperCase() + name.slice(1)
+    b.dataset.theme = name
+    presets.appendChild(b)
+  }
+  const named = () => document.documentElement.classList.contains(THEMES.light.className) ? 'light' : 'dark'
+  const applyTheme = name => {
+    const t = THEMES[name] ?? THEMES.dark
+    document.documentElement.classList.toggle(THEMES.dark.className, name === 'dark')
+    document.documentElement.classList.toggle(THEMES.light.className, name === 'light')
+    document.querySelector('meta[name=theme-color]').setAttribute('content', t.color)
+    for (const b of document.querySelectorAll('[data-theme]')) b.classList.toggle('sticky', b.dataset.theme === name)
+  }
+  // A saved preference wins only when it names a theme this server will serve
+  // on reload; otherwise the page default (from --theme) stands. An unknown
+  // stored value must not strip both classes (an html with no theme is a
+  // transparent page), so it resolves to dark and is not re-saved.
+  let saved = null
+  try { saved = localStorage.getItem('afield-theme') } catch {}
+  applyTheme(saved && THEMES[saved] ? saved : named())
+
+  const acts = {
+    close: hideMenu,
+    tabs: () => {
+      tabsEnabled = !tabsEnabled
+      localStorage.setItem('afield-tabs', tabsEnabled ? 'on' : 'off')
+      updateTabsToggle()
+      if (tabsEnabled) refreshTabs()
+      else tabs.hidden = true
+    },
+    'zoom-in': () => setScale(state.scale * ZOOM_STEP),
+    'zoom-out': () => setScale(state.scale / ZOOM_STEP),
+    'zoom-reset': () => setScale(1),
+    top: () => { stopReading(); screen.scrollTop = 0; hideMenu() },
+    bottom: () => { stopReading(); screen.scrollTop = screen.scrollHeight; hideMenu() },
+    // iOS offers its paste callout on a real, visible field; the terminal's own
+    // input is hidden, so there is nothing there to long-press.
+    'send-paste': () => {
+      const field = $('paste')
+      if (!field.value) return
+      conn.send(field.value)
+      field.value = ''
+      term.input?.resetMirror()
+      hideMenu()
+    },
+    // A view rather than another section. The readout is dozens of lines, and
+    // stacked under everything else it fills the screen — while nobody reading
+    // it wants the folder list and the grid presets in the way.
+    diag: () => {
+      foldDiag($('diag').hidden)
+      if (!$('diag').hidden) showDiagnostics()
+    },
+    reconnect: () => conn.reconnectNow(),
+    // Local only: pi's own screen is untouched and its next repaint restores
+    // it. The hold goes with the old screen — those bytes were drawn against
+    // a view that no longer exists.
+    'clear-view': () => { dropHeld(); term.write(CURSOR_HOME + ERASE_SCREEN + ERASE_SAVED) },
+    // Standalone has no browser chrome, so this is the only way to pick up a
+    // new build by hand. Re-fetch past the cache first, or the reload just
+    // reinstates the copy iOS is already holding.
+    reload: () => location.replace(`${location.pathname}?b=${Date.now().toString(36)}`),
+  }
+  menu.addEventListener('click', e => {
+    const theme = e.target.closest('[data-theme]')
+    if (theme) {
+      // Sticky next visit without a restart (which would kill pi). The choice
+      // is per-device and per-browser; it is not the server's flag -- theme is
+      // a suggestion, and this is the last word.
+      applyTheme(theme.dataset.theme)
+      try { localStorage.setItem('afield-theme', theme.dataset.theme) } catch {}
+      return
+    }
+    const target = e.target.closest('[data-act]')
+    if (target) acts[target.dataset.act]()
+    else if (e.target === menu) hideMenu()
+  })
+}
+
+// ---------------------------------------------------------------- start
+
+async function checkForNewBuild() {
+  // Best effort: a dropped tunnel is not a client fault, and an unhandled
+  // rejection here would paint the error panel over a working terminal.
+  const html = await fetch(location.pathname, { cache: 'reload' }).then(r => r.text()).catch(() => '')
+  const served = buildIdOf(new DOMParser().parseFromString(html, 'text/html'))
+  if (!served || served === BUILD_ID) return
+  // Go to a URL iOS has no cached copy of. `location.reload()` is routinely
+  // served the same stale document, and the id in the query means the page that
+  // arrives already matches — so this cannot loop and needs no guard.
+  location.replace(`${location.pathname}?b=${served}`)
+}
+
+async function main() {
+  const initialVersion = selectionVersion
+  state.cell = measureCell(state.fontSize)
+  // Set on the element, not :root — `.wterm` declares its own defaults, which
+  // would win over anything merely inherited.
+  screen.style.setProperty('--term-font-size', `${state.fontSize}px`)
+  screen.style.setProperty('--term-row-height', `${state.cell.height}px`)
+
+  document.documentElement.style.setProperty('--bar-h', `${KEY_BAR_H}px`)
+  strip.style.flexBasis = `${state.cell.height}px`
+  buildKeys()
+  buildMenu()
+  if (tabsEnabled) refreshTabs()
+  document.addEventListener('visibilitychange', () => {
+    if (tabsEnabled && !document.hidden) refreshTabs()
+  })
+  setInterval(() => {
+    if (!tabsEnabled || document.hidden) return
+    refreshTabs()
+  }, 15_000)
+  $('scale-val').textContent = '100%'
+  $('diag-overlay').addEventListener('click', () => { $('diag-overlay').hidden = true })
+
+  await term.init()
+  term.input.keyChord = modChord
+  terminalInput().addEventListener('blur', () => { awaitingKeyboard = false })
+  // The server's snapshot carries this many lines of history; a core keeping
+  // fewer would drop the oldest of them on arrival.
+  term.bridge.setScrollbackLines(Number(document.querySelector('meta[name=scrollback]').content))
+  meter = await WasmBridge.load()
+  meter.init(state.cols, state.rows)
+
+  screen.addEventListener('scroll', onScroll)
+  toBottom.addEventListener('click', () => { stopReading(); screen.scrollTop = screen.scrollHeight })
+  tabsLeft.addEventListener('click', () => tabs.scrollBy({ left: -tabs.clientWidth * 0.8, behavior: 'smooth' }))
+  tabsRight.addEventListener('click', () => tabs.scrollBy({ left: tabs.clientWidth * 0.8, behavior: 'smooth' }))
+  tabs.addEventListener('scroll', updateTabArrows)
+  new ResizeObserver(updateTabArrows).observe(tabs)
+
+  fitGrid(applyLayout())
+  // env() insets are not resolved on the first pass, so the first fit is short
+  // by the bottom inset and leaves rows permanently below the fold. Refit once
+  // the real values are in.
+  requestAnimationFrame(() => fitGrid(applyLayout()))
+  // A launch in landscape starts the page in portrait and turns it during the
+  // await below. Listening from here on is what refits the grid for that.
+  visualViewport.addEventListener('resize', onViewportChange)
+  visualViewport.addEventListener('scroll', onViewportChange)
+  window.addEventListener('orientationchange', onViewportChange)
+  // Chrome on Android is still moving the viewport after a reload, past both
+  // fits above: for a few frames it stops the page short of the gesture bar
+  // while already reporting the bar's inset. So a settle follows here too, and
+  // refits if the viewport comes to rest anywhere else.
+  onViewportChange()
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  for (const type of ['focus', 'blur', 'pageshow', 'pagehide']) window.addEventListener(type, () => record(`w.${type}`))
+  for (const type of ['focus', 'blur']) terminalInput().addEventListener(type, () => record(type))
+  // iOS moves the viewport with no event while the page is hidden.
+  setInterval(() => {
+    if (settle === null && viewportReading() !== lastReading) record('poll')
+  }, 1000)
+
+  const place = await resolveInitialPlace()
+  if (place && selectionVersion === initialVersion) {
+    pendingPlace = place
+    conn.url = sessionUrl(place)
+    conn.connect({ cols: state.wanted.cols, rows: state.wanted.rows })
+  }
+
+  checkForNewBuild()
+}
+
+main().catch(e => reportFatal(`startup: ${e?.message ?? e}`))

@@ -1,0 +1,416 @@
+// The front door: one supervisor holding live PTYs independently of pi conversations.
+//
+// Auth, origin-checking and the client HTML build live here. A session a viewer
+// joins keeps running after that viewer leaves, and a different viewer (phone,
+// a second `attach`, a third) can be looking at a different one at the same
+// time. `GET /places` answers what sessions exist and which are running;
+// `POST /start` begins a fresh PTY, pi or a shell; `/ws?process=<id>` joins a live one,
+// while `/ws?session=<id>&cwd=<path>` opens a saved conversation.
+import { createServer } from 'node:http'
+import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
+import { WebSocket, WebSocketServer } from 'ws'
+import { Auth, loginPage } from './auth.js'
+import { buildClient } from './client.js'
+import { isAddress, originAllowed } from './origin.js'
+import { PI_SESSIONS, placeNames, readPlaces, findPlace, canonical, subfolders, lastWrite } from './places.js'
+import { BACKLOG_LIMIT, TOO_FAR_BEHIND } from './viewer.js'
+import { DEFAULT_SCROLLBACK } from './protocol.js'
+import { Registry } from './registry.js'
+
+const MAX_FRAME = 1024 * 1024
+
+// How long a just-spawned child gets to come up before a join gives up on it,
+// and how often to retry while waiting. Generous: a slow machine cold-starting
+// node plus pi is not the same failure as pi simply not existing.
+const CHILD_READY_MS = 8_000
+const CHILD_RETRY_MS = 75
+
+// Said the same way whether /start answers it or a socket closes on it. The
+// registry decides the number, so nothing here repeats the default.
+const poolFull = cap => `${cap} sessions are running (the limit); end one first`
+
+/** The order a full pool is picked over: a session nobody is watching goes
+ *  before one with viewers on it, and within each the quietest goes first. */
+const pickOrder = (a, b) => (a.viewers ? 1 : 0) - (b.viewers ? 1 : 0) || a.active - b.active
+
+const connectChild = (socketPath, readyMs) => new Promise((resolveConn, rejectConn) => {
+  const deadline = Date.now() + readyMs
+  const attempt = () => {
+    const sock = new WebSocket(`ws+unix://${socketPath}:/ws`, ['tty'])
+    sock.once('open', () => resolveConn(sock))
+    sock.once('error', () => {
+      sock.terminate()
+      if (Date.now() > deadline) return rejectConn(new Error(`session on ${socketPath} never came up`))
+      setTimeout(attempt, CHILD_RETRY_MS)
+    })
+  }
+  attempt()
+})
+
+export function createSupervisor({ port, bind, hostname, key, pi, shell, cliPath, sessionDir = PI_SESSIONS, socketDir = tmpdir(), cap, theme = 'dark', scrollback = DEFAULT_SCROLLBACK, newDir, pingMs = 30_000, childReadyMs = CHILD_READY_MS, onListen, onExit }) {
+  const auth = new Auth(key)
+  const registry = new Registry({ cliPath, pi, shell, socketDir, cap, scrollback })
+  // Without pi there are no conversations to list or open, wherever pi once kept them.
+  const store = pi ? sessionDir : null
+  // Where a brand-new session starts: given, or the folder this run was
+  // launched from (see cli.js, which pins it before anything can chdir away).
+  const defaultDir = newDir ?? process.cwd()
+
+  // How many viewers are on a live child: "2 watching" on a row says the
+  // session is shared right now, not just alive.
+  const watching = processId => [...wss.clients].filter(c => c.readyState === c.OPEN && c.processId === processId).length
+
+  /** Every running terminal, as rows of the list. `active` is only needed
+   *  for the full-pool picker, where it marks the last sign of work. */
+  const runningRows = async (withActive = false) => Promise.all(registry.running().map(async child => {
+    const current = registry.current(child)
+    const written = async () => Math.max(child.lastOutputAt ?? 0, current.file ? await lastWrite(current.file) : 0)
+    return {
+      id: current.id,
+      cwd: current.cwd,
+      file: current.file,
+      ...placeNames(current.cwd),
+      at: current.at ?? child.joinedAt,
+      ...(withActive ? { active: await written() || child.joinedAt } : {}),
+      // As the child reports it (server/index.js): a program that says nothing never works.
+      working: child.working,
+      // Unread when nobody is watching and it stopped working after the last viewer left or spawn.
+      // The registry's list, not open sockets: it drops a viewer in the same step seenAt is stamped.
+      unread: !child.working && child.sockets.length === 0 && child.stoppedAt > child.seenAt,
+      // A shell in the same folder as a pi needs telling apart from it.
+      label: child.kind === 'shell' ? `${basename(shell)} · ${basename(current.cwd)}` : basename(current.cwd),
+      kind: child.kind,
+      processId: child.processId,
+      startedAt: child.startedAt,
+    }
+  }))
+
+  // The query is ignored: `?b=<id>` is only there to give the client a URL iOS
+  // has no cached copy of, and what it gets back is whatever is current. It must
+  // not be cached any harder than `/` either — the home screen launches a fixed
+  // URL, so pinning that one would strand the phone on an old build for good.
+  const loginHeaders = { 'content-type': 'text/html', 'cache-control': 'no-store' }
+  const originAllowedReq = req => originAllowed({
+    origin: req.headers.origin,
+    host: req.headers.host,
+    hostname,
+  })
+
+  /** A request body as text, capped hard: no route here takes much. */
+  const readBody = (req, cap) => new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', chunk => {
+      size += chunk.length
+      if (size > cap) return void req.destroy()
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString()))
+    req.on('error', reject)
+  })
+
+  const handle = async (req, res) => {
+    // One gate ahead of dispatch, so no route can forget it: to a rebound
+    // page every request here is same-origin (see origin.js).
+    if (!originAllowedReq(req)) return void res.writeHead(403).end()
+    const path = req.url?.split('?')[0]
+
+    // The QR code opens a link, so it has to be GET. The form posts, which keeps
+    // a typed key out of the address, browser history and proxy logs.
+    if (path === '/login' && (req.method === 'GET' || req.method === 'POST') && auth.required) {
+      const attempt = req.method === 'POST'
+        ? new URLSearchParams(await readBody(req, 4096).catch(() => '')).get('key')
+        : new URL(req.url, 'http://internal').searchParams.get('key')
+      if (!attempt || !auth.accepts(attempt)) return void res.writeHead(401, loginHeaders).end(loginPage(true))
+      const secure = req.headers['x-forwarded-proto'] === 'https'
+      return void res.writeHead(303, { location: '/', 'set-cookie': auth.cookie({ secure }) }).end()
+    }
+
+    if (path === '/places' && req.method === 'GET') {
+      if (!auth.admits(req)) return void res.writeHead(401).end()
+      // A caller that names no window gets every session there is, so
+      // `afield end` and `attach` can never be reading a list that quietly
+      // omits a running one. The phone menu asks for a window at a time.
+      const query = new URL(req.url, 'http://internal').searchParams
+      const limit = query.has('limit') ? Number(query.get('limit')) : Number.MAX_SAFE_INTEGER
+      const offset = query.has('offset') ? Number(query.get('offset')) : 0
+      // Window params mean nothing to an exact-id request, so they are not
+      // validated there: naming an id is not a malformed window.
+      if (!query.has('id') && (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(offset) || offset < 0)) {
+        return void res.writeHead(422, { 'content-type': 'text/plain' }).end('offset and limit must be whole numbers, limit at least 1')
+      }
+      // An exact id is answered even when the session is a fork, which the
+      // windowed list never shows: a caller that already knows the id needs
+      // no menu row, and the join below serves whatever findPlace returns.
+      const named = query.get('id')
+      // Past the cap, the picker asks which running session to end: the rows
+      // it shows are the same ones, first the ones a viewer would give up
+      // least -- nothing watching it, nothing it has written lately.
+      if (query.get('running') === '1') {
+        const rows = (await runningRows(true)).map(s => ({ ...s, running: true, viewers: watching(s.processId) }))
+        const sessions = rows.sort(pickOrder)
+        const body = JSON.stringify({ current: sessions[0]?.processId ?? null, sessions, more: false, offset: 0, here: defaultDir })
+        return void res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(body)
+      }
+      // What the running terminals have open, as rows of the same list.
+      const live = await runningRows()
+      // A row answered by id is the live one when its terminal is up -- a
+      // running terminal answers from the registry before the store is read
+      // at all -- so running and viewer counts read like any row of the list.
+      const liveHit = named && live.find(r => r.id === named)
+      const single = named && !liveHit ? await findPlace({ sessionDir: store, id: named }) : null
+      const { sessions: found, more } = named
+        ? { sessions: [liveHit ?? single].filter(Boolean), more: false }
+        : await readPlaces({ sessionDir: store, offset, limit, live })
+      // How many viewers are on each live child, for the listings.
+      const sessions = found.map(place => ({
+        ...place,
+        running: Boolean(place.processId),
+        viewers: place.processId ? watching(place.processId) : 0,
+      }))
+      const body = JSON.stringify({
+        current: sessions.find(s => s.running)?.processId ?? null,
+        sessions,
+        more,
+        // Where the next window starts, passed back rather than counted by
+        // the caller: the rows to show are the server's to page.
+        offset: offset + found.length,
+        here: defaultDir,
+        kinds: registry.kinds,
+      })
+      return void res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(body)
+    }
+
+    // End a running session for good: the child gets SIGTERM, then SIGKILL
+    // after a grace (`registry.end`), and its viewers hear that a terminal
+    // asked for it. Deleted-for-real is pi's own business; this stops the
+    // process, which is what afield owns.
+    if (path === '/terminal' && req.method === 'DELETE') {
+      if (!auth.admits(req)) return void res.writeHead(401).end()
+      const id = new URL(req.url, 'http://internal').searchParams.get('process')
+      const child = id && registry.child(id)
+      if (!child) return void res.writeHead(404, { 'content-type': 'text/plain' }).end(id ? 'that terminal is not running' : 'which terminal')
+      console.error(`server: ending terminal ${id} on request`)
+      await registry.end(id)
+      return void res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ended: id }))
+    }
+
+    // Start a session that has no transcript yet: mint an id, spawn pi (or a
+    // shell, when asked) in the named directory, and let the client join it
+    // like any other.
+    if (path === '/start' && req.method === 'POST') {
+      if (!auth.admits(req)) return void res.writeHead(401).end()
+      // /start's whole payload is a directory and a kind.
+      const body = await readBody(req, 512).then(JSON.parse).catch(() => null)
+      // Any directory that exists can hold a session: joining one already
+      // gives a full bash prompt, so restricting the start list would be
+      // ceremony. canonical() is null for a path that does not resolve.
+      const wanted = typeof body?.cwd === 'string' ? await canonical(body.cwd.trim()) : null
+      if (!wanted) return void res.writeHead(422, { 'content-type': 'text/plain' }).end('no such directory to start a session in')
+      const kind = body.kind ?? 'pi'
+      if (!registry.kinds.includes(kind)) {
+        return void res.writeHead(422, { 'content-type': 'text/plain' }).end(`this server does not start ${JSON.stringify(kind)} sessions`)
+      }
+      const id = randomUUID()
+      // Past the cap nothing is ended behind the caller's back: the refusal is
+      // the pick list, and the caller ends the one it chooses.
+      const child = await registry.start(id, wanted, { kind })
+      if (!child) return void res.writeHead(409, { 'content-type': 'text/plain' }).end(poolFull(registry.cap))
+      return void res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id, cwd: wanted, processId: child.processId }))
+    }
+
+    // Browsing folders requires the same authentication as listing sessions.
+    if (path === '/subfolders' && req.method === 'GET') {
+      if (!auth.admits(req)) return void res.writeHead(401).end()
+      const want = new URL(req.url, 'http://internal').searchParams.get('cwd') ?? defaultDir
+      const found = await subfolders(want)
+      if (!found) return void res.writeHead(404, { 'content-type': 'text/plain' }).end('no such directory')
+      return void res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(found))
+    }
+
+    // The Home-screen icon, the one thing here that is not the page itself.
+    // iOS asks for it without the session cookie when the page is added to the
+    // Home screen, so it answers without auth -- a 401 there means no icon.
+    // Read per request like the page, so editing it needs no restart.
+    if (path === '/apple-touch-icon.png' && req.method === 'GET') {
+      const png = await readFile(new URL('../src/apple-touch-icon.png', import.meta.url))
+      return void res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-cache' }).end(png)
+    }
+
+    if (path !== '/') return void res.writeHead(404).end()
+    if (!auth.admits(req)) return void res.writeHead(200, loginHeaders).end(loginPage())
+
+    const client = await buildClient({ theme, scrollback })
+    const headers = { etag: client.etag, 'cache-control': 'no-cache' }
+    if (req.headers['if-none-match'] === client.etag) return void res.writeHead(304, headers).end()
+    res.writeHead(200, { ...headers, 'content-type': 'text/html' }).end(client.page)
+  }
+
+  // A throw in here would otherwise be the end of the supervisor and every PTY under
+  // it; a request that cannot be answered is one 500 instead. One kind says
+  // more than that: spawn() itself refused -- no file descriptors left, say --
+  // which is the machine's failing rather than the request's, and a fresh 503
+  // is a retry later where a bare 500 reads like a bad request.
+  const http = createServer((req, res) => {
+    handle(req, res).catch(err => {
+      console.error('server: could not answer a request', err)
+      if (res.headersSent) return void res.end()
+      const spawnFailed = err?.syscall === 'spawn'
+      res.writeHead(spawnFailed ? 503 : 500, { 'content-type': 'text/plain' })
+        .end(spawnFailed ? 'this server cannot start a terminal right now' : String(err.message ?? err))
+    })
+  })
+
+  const wss = new WebSocketServer({
+    server: http,
+    path: '/ws',
+    maxPayload: MAX_FRAME,
+    handleProtocols: () => 'tty',
+    verifyClient: ({ req }) => {
+      const { origin, host } = req.headers
+      if (!auth.admits(req)) {
+        console.error('server: refused a socket that has not logged in')
+        return false
+      }
+      if (originAllowed({ origin, host, hostname })) return true
+      const undeclared = !hostname && host && !isAddress(host)
+      console.error(`server: refused a socket from ${origin} for host ${host}` +
+        `${undeclared ? ' — a proxy in front of this needs --hostname' : ''}`)
+      return false
+    },
+  })
+
+  wss.on('error', err => {
+    console.error(err.code === 'EADDRINUSE'
+      ? `server: port ${port} is already in use\n` +
+        `  if that is another afield:  afield --port ${port} attach\n` +
+        `  if it is something else:        serve on another --port`
+      : `server: cannot listen on ${bind}:${port}: ${err.message}`)
+    onExit?.({ exitCode: 1, signal: 0 })
+  })
+
+  // A process ID joins an existing PTY regardless of /new or /resume inside
+  // it. A conversation ID plus cwd opens history only if it is not live.
+  wss.on('connection', (ws, req) => {
+    // Set by the pong that answers each ping and cleared by the ping itself;
+    // a socket that misses a round is terminated by the loop below.
+    ws.answered = true
+    ws.on('pong', () => { ws.answered = true })
+
+    const url = new URL(req.url, 'http://internal')
+    const id = url.searchParams.get('session')
+    const cwd = url.searchParams.get('cwd')
+    const processId = url.searchParams.get('process')
+
+    let inner = null
+    let buffered = []
+    let closed = false
+    // Registered with the registry once the relay is live, so the child's death can
+    // cut this browser side down here rather than waiting for the socket teardown
+    // to be noticed below.
+    let registered = null
+
+    // Attached before anything here awaits: the client sends its handshake the
+    // instant its socket opens, and a listener added even one microtask late
+    // would simply never see it — an EventEmitter drops what nothing is
+    // listening for rather than queuing it.
+    ws.on('message', data => {
+      if (inner && inner.readyState === inner.OPEN) inner.send(data)
+      else buffered?.push(data)
+    })
+    ws.on('close', () => { closed = true; registered?.(); inner?.close() })
+    ws.on('error', () => { closed = true; registered?.(); inner?.close() })
+
+    ;(async () => {
+      let child = processId ? registry.child(processId) : undefined
+      if (child) child.joinedAt = Date.now()
+      // A process from an earlier run of this server went with it. Sent with
+      // the conversation it was showing, that conversation reopens instead:
+      // how a phone gets back after a restart. One that ended in this run
+      // stays ended.
+      else if (processId && (registry.startedHere(processId) || !id || !cwd)) { ws.close(4004, 'terminal is no longer running'); return }
+      else {
+        const place = await findPlace({ sessionDir: store, id, cwd: cwd || undefined })
+        if (!id || !place) { ws.close(4004, 'no such conversation'); return }
+        child = await registry.ensure(id, place.cwd)
+        if (!child) { ws.close(4006, poolFull(registry.cap)); return }
+      }
+      if (closed) return
+      ws.processId = child.processId
+      const sock = await connectChild(child.socketPath, childReadyMs)
+      if (closed) { sock.close(); return }
+      // The child states the place on admission, from the identity file it
+      // owns: this relay carries frames, it does not invent them.
+      inner = sock
+      registered = registry.watch(child.processId, reason => { sock.close(); ws.close(1001, reason) })
+      for (const data of buffered) inner.send(data)
+      buffered = null
+      // Same rule the session itself applies to its viewers (server/viewer.js):
+      // catch up, or be disconnected — never fall behind without bound. The
+      // check is before the write, so a socket that cannot take this chunk is
+      // cut loose instead of being sent part of it; the client's own reconnect
+      // picks the stream back up at a fresh snapshot. Cutting only this hop
+      // also stops the drain here from hiding a stalled phone from the child's
+      // own backlog limit, which is what would otherwise grow without bound.
+      inner.on('message', data => {
+        if (ws.readyState !== ws.OPEN) return
+        if (ws.bufferedAmount + data.length > BACKLOG_LIMIT) {
+          ws.close(TOO_FAR_BEHIND, 'too far behind')
+          return
+        }
+        ws.send(data)
+      })
+      inner.on('close', () => {
+        registered?.()
+        // end() records the reason before it signals, so this lookup sees it
+        // whenever the inner socket beats the registry's own exit callback
+        // here; the other order, the callback above already closed this ws
+        // with the same reason and this close is the ignored one.
+        ws.close(1001, registry.child(child.processId)?.endReason ?? `${child.kind} exited`)
+      })
+      inner.on('error', () => { registered?.(); ws.close(1011, 'lost the session') })
+    })().catch(err => {
+      console.error(`server: could not reach terminal ${processId ?? id}`, err)
+      ws.close(4005, 'could not reach the session')
+    })
+  })
+
+  // Cleared before each ping and set by the pong that answers it, exactly as
+  // one session's server does its viewers (server/index.js): a socket that
+  // has not answered the last ping is terminated, since a phone asleep behind
+  // a dead tunnel is gone for good — and holding its relay open holds memory
+  // on this side too.
+  const ping = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.readyState !== ws.OPEN) continue
+      if (!ws.answered) { ws.terminate(); continue }
+      ws.answered = false
+      ws.ping()
+    }
+  }, pingMs)
+  ping.unref()
+
+  http.listen(port, bind, () => onListen?.({ port: http.address().port, bind }))
+
+  return {
+    http,
+    registry,
+    async close() {
+      clearInterval(ping)
+      // Stop listening first. A phone retrying while the children die would
+      // otherwise reach this server, be told its terminal is gone, and give
+      // up; refused, it keeps backing off until the next server is up.
+      const closed = new Promise(res => http.close(res))
+      // That leaves open sockets alone, so they go next, before the children:
+      // ending a session makes its viewers reconnect, and nothing should be
+      // reconnecting to a session that is dying.
+      for (const ws of wss.clients) ws.terminate()
+      await registry.endAll()
+      wss.close()
+      await closed
+    },
+  }
+}
