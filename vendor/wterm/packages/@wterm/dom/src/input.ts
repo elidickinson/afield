@@ -1,3 +1,4 @@
+// Modified for afield from upstream wterm; see vendor/wterm/README.md.
 import type { TerminalCore } from "@wterm/core";
 import { isLinkActivationModifier } from "./hyperlink.js";
 
@@ -52,14 +53,34 @@ export class InputHandler {
     rowHeight: number;
   } | null;
   private composing = false;
+  private readonly iosQuickPath =
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
   private mouseButtons = 0;
   private focused = false;
+  // The field is a mirror of the PTY's input line: `sent` is what this class
+  // has transmitted of the field's content. Every byte the PTY receives from
+  // anywhere else (bar keys, Enter, paste, PTY resets) must invalidate the
+  // mirror via resetMirror(), or the next diff sends bytes that double-apply.
+  private sent = "";
+  private idleClear: ReturnType<typeof setTimeout> | null = null;
+  private segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  /** True while the diff is transmitting, so consumers can exempt it from
+   *  modifier chords and other send-side rewriting. */
+  inFlush = false;
+  /** Consulted when an insertText event adds exactly one grapheme to the
+   *  field and removes nothing: a typed key, as far as the field can tell,
+   *  and the only sign of one from keyboards whose keydowns are keyCode 229.
+   *  Returns the bytes to send in its place (a modifier chord), or null to
+   *  transmit it as typed. */
+  keyChord: ((key: string) => string | null) | null = null;
 
   private _onKeyDown: (e: KeyboardEvent) => void;
   private _onPaste: (e: ClipboardEvent) => void;
   private _onCompositionStart: () => void;
   private _onCompositionEnd: (e: CompositionEvent) => void;
-  private _onInput: () => void;
+  private _onBeforeInput: (e: InputEvent) => void;
+  private _onInput: (e: InputEvent) => void;
   private _onFocus: () => void;
   private _onBlur: () => void;
   private _onMouseDown: (e: MouseEvent) => void;
@@ -88,11 +109,19 @@ export class InputHandler {
     this.textarea.setAttribute("tabindex", "0");
     this.textarea.setAttribute("aria-hidden", "true");
     const s = this.textarea.style;
-    s.position = "absolute";
-    s.left = "-9999px";
-    s.top = "0";
+    // Sticky at the scrollport's bottom edge: the caret is always in view, so
+    // WebKit's reveal-the-caret scrolling (swipe, dictation, any real
+    // insertion) has nothing to correct and never drags the scroller to the
+    // top of history, where an absolutely-positioned field at top: 0 put it.
+    // The element is fully transparent, 1px wide and 0 tall, so being in view
+    // shows nothing and adds nothing to the scroll geometry; in flow it sits
+    // after the grid, which keeps it out of every row-height invariant.
+    s.position = "sticky";
+    s.bottom = "0";
+    s.left = "0";
+    s.top = "auto";
     s.width = "1px";
-    s.height = "1px";
+    s.height = "0";
     s.opacity = "0";
     s.overflow = "hidden";
     s.border = "0";
@@ -110,6 +139,7 @@ export class InputHandler {
     this._onPaste = this.handlePaste.bind(this);
     this._onCompositionStart = this.handleCompositionStart.bind(this);
     this._onCompositionEnd = this.handleCompositionEnd.bind(this);
+    this._onBeforeInput = this.handleBeforeInput.bind(this);
     this._onInput = this.handleInput.bind(this);
     this._onFocus = () => {
       if (this.focused) return;
@@ -145,6 +175,7 @@ export class InputHandler {
       "compositionend",
       this._onCompositionEnd as EventListener,
     );
+    this.textarea.addEventListener("beforeinput", this._onBeforeInput);
     this.textarea.addEventListener("input", this._onInput);
     this.textarea.addEventListener("focus", this._onFocus);
     this.textarea.addEventListener("blur", this._onBlur);
@@ -157,6 +188,7 @@ export class InputHandler {
   }
 
   destroy(): void {
+    if (this.idleClear !== null) clearTimeout(this.idleClear);
     this.textarea.removeEventListener("keydown", this._onKeyDown);
     this.textarea.removeEventListener("paste", this._onPaste as EventListener);
     this.textarea.removeEventListener(
@@ -167,6 +199,7 @@ export class InputHandler {
       "compositionend",
       this._onCompositionEnd as EventListener,
     );
+    this.textarea.removeEventListener("beforeinput", this._onBeforeInput);
     this.textarea.removeEventListener("input", this._onInput);
     this.textarea.removeEventListener("focus", this._onFocus);
     this.textarea.removeEventListener("blur", this._onBlur);
@@ -178,8 +211,27 @@ export class InputHandler {
   }
 
   private handleKeyDown(e: KeyboardEvent): void {
-    if (this.composing) return;
+    if (e.isComposing || e.keyCode === 229) return;
+    // A non-composing event releases the latch if the IME omitted compositionend.
+    this.composing = false;
 
+    // A non-empty field lets the software keyboard drive deletion natively:
+    // repeats may arrive as deleteContentBackward input events, not keydowns,
+    // and preventDefault here would cancel that loop. Stand aside and let the
+    // diff turn the deletion into DEL bytes. Only for an unmodified Backspace:
+    // a modified one carries terminal meaning of its own -- alt+Backspace is
+    // esc+DEL (word delete), meta+Backspace kill-line -- and must keep the
+    // keydown path below, which resets the mirror for the line change it
+    // makes directly. An empty field leaves the keydown path as the
+    // deletion's owner even unmodified.
+    if (
+      e.key === "Backspace" &&
+      !e.altKey &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      this.textarea.value !== ""
+    )
+      return;
     if ((e.metaKey || e.ctrlKey) && e.key === "c") {
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
@@ -191,6 +243,10 @@ export class InputHandler {
     if (e.metaKey && !e.ctrlKey) {
       if (e.key === "Backspace") {
         e.preventDefault();
+        // Kill-line empties the PTY's line directly, so the mirror must go
+        // with it -- reachable now with a non-empty field, since modified
+        // Backspace no longer stands aside.
+        this.resetMirror();
         this.onData("\x15");
       } else if (e.key === "a") {
         e.preventDefault();
@@ -205,9 +261,19 @@ export class InputHandler {
       return;
     }
 
-    e.preventDefault();
+    // Only preventDefault once a sequence is actually produced: keys with no
+    // terminal meaning (an emoji keydown carries the character as a 2-unit
+    // string, for one) must keep their default action, which is a real
+    // insertion into the field -- the input event then carries it through the
+    // diff. Suppressing it here is what made emoji presses do nothing.
     const seq = this.keyToSequence(e);
-    if (seq) this.onData(seq);
+    if (!seq) return;
+    e.preventDefault();
+    // Everything a keydown sends either changes or consumes the PTY's line,
+    // so the mirror goes: arrows move the cursor (the diff transport assumes
+    // end-of-line), Enter consumes the line, a printable appends to it.
+    this.resetMirror();
+    this.onData(seq);
   }
 
   private handlePaste(e: ClipboardEvent): void {
@@ -224,6 +290,7 @@ export class InputHandler {
     } else {
       this.onData(text);
     }
+    this.resetMirror();
   }
 
   private handleCompositionStart(): void {
@@ -232,17 +299,198 @@ export class InputHandler {
 
   private handleCompositionEnd(e: CompositionEvent): void {
     this.composing = false;
-    if (e.data) this.onData(e.data);
-    this.textarea.value = "";
+    this.separateCommittedText();
+    // Do not send e.data: engines disagree about whether the final `input`
+    // fires before or after `compositionend`, and the committed text is in
+    // the field either way -- flush() is idempotent, so whichever event
+    // carries it first transmits it exactly once.
+    this.flush();
   }
 
-  private handleInput(): void {
-    if (this.composing) return;
+  /**
+   * The QuickPath separator rule, shared by both delivery paths: iOS emits
+   * its separator space only after an insertion it scored as a word, so a
+   * swiped single letter -- and whatever is swiped or dictated right after
+   * it -- arrives glued to the previous word. Tapped keys cannot confuse the
+   * rule: they are preventDefaulted in the keydown path and never reach the
+   * field as input events. An insertion of one or more letters landing
+   * directly against a word or number character therefore gets one separator
+   * space spliced in front of it, before the diff transmits. `insertAt` is
+   * where the inserted run begins, `caret` where the engine left the caret
+   * (after the run). Replacement events (autocorrect) and anything already
+   * spaced are exempt by the callers' gates. Unicode letters and numbers:
+   * dictation and swipe do not stop at ASCII.
+   */
+  private separateInsertedLetters(added: string, insertAt: number, caret: number): void {
+    if (insertAt <= 0 || !/^[\p{L}]+$/u.test(added)) return;
+    const before = this.textarea.value.slice(0, insertAt);
+    if (!/[\p{L}\p{N}]$/u.test(before)) return;
+    this.textarea.value = `${before} ${added}${this.textarea.value.slice(insertAt + added.length)}`;
+    this.textarea.setSelectionRange(caret + 1, caret + 1);
+  }
+
+  /** Applied at composition end: QuickPath may deliver through the
+   *  marked-text pathway, where per-event interception is off-limits because
+   *  the engine owns the field mid-composition. Once the composition
+   *  commits, the text is ours again and the withheld space can be spliced
+   *  in before the diff transmits. */
+  private separateCommittedText(): void {
+    if (!this.iosQuickPath) return;
     const value = this.textarea.value;
-    if (value) {
-      this.onData(value);
-      this.textarea.value = "";
+    let p = 0;
+    while (p < this.sent.length && p < value.length && this.sent[p] === value[p]) p++;
+    if (p < value.length) this.separateInsertedLetters(value.slice(p), p, value.length);
+  }
+
+  private separateSwipeInsertion(e: InputEvent): void {
+    if (!this.iosQuickPath || e.inputType !== "insertText" || !e.data) return;
+    const ta = this.textarea;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    if (start === null || start !== end) return;
+    this.separateInsertedLetters(e.data, end - e.data.length, end);
+  }
+
+  private handleBeforeInput(e: InputEvent): void {
+    if (e.inputType !== "deleteContentBackward" || e.isComposing) return;
+    this.composing = false;
+    if (this.textarea.value && !e.cancelable) return;
+    e.preventDefault();
+
+    if (!this.textarea.value) {
+      this.resetMirror();
+      this.sendDiff("\x7f");
+      return;
     }
+
+    const graphemes = Array.from(
+      this.segmenter.segment(this.textarea.value),
+      (x) => x.segment,
+    );
+    this.textarea.value = graphemes.slice(0, -1).join("");
+    this.textarea.setSelectionRange(
+      this.textarea.value.length,
+      this.textarea.value.length,
+    );
+    this.flush();
+  }
+
+  private handleInput(e: InputEvent): void {
+    if (e.isComposing) return;
+    // A committed event releases the latch if an IME omitted compositionend
+    // after an external key reset the field.
+    this.composing = false;
+    this.separateSwipeInsertion(e);
+    this.flush(e.inputType === "insertText");
+  }
+
+  private sendDiff(data: string): void {
+    this.inFlush = true;
+    try {
+      this.onData(data);
+    } finally {
+      this.inFlush = false;
+    }
+  }
+
+  /**
+   * Transmit the difference between the field and what has already been
+   * sent. The field is never wiped: iOS's text-insertion system (QuickPath,
+   * dictation, the emoji keyboard) reads it to decide things like the
+   * separator space between swiped words, and an empty field reads as
+   * "nothing to separate".
+   *
+   * Erase counts are graphemes -- that is what a terminal line editor removes
+   * per DEL (verified against pi) -- and the transport assumes the PTY's
+   * cursor is at end-of-line, which every mirror invalidation exists to
+   * protect. DEL erases from that end, so a change anywhere in the field
+   * erases everything after its start and sends it again.
+   *
+   * A newline inside the inserted text is translated to CR (dictation emits
+   * insertParagraph). Everything before a CR is consumed by the program, and
+   * the field's tail after the last CR is exactly the PTY's new line, so the
+   * mirror stays aligned without touching the field mid-dictation. Consumed
+   * lines cannot be unsent, so the diff covers only the lines after the ones
+   * already sent: an edit to an earlier line (dictation revising a word, or
+   * auto-punctuation before a newline) is dropped rather than resubmitted.
+   *
+   * `typed` marks an insertText event, the only kind that can be a key:
+   * composition commits and replacements are never offered to keyChord.
+   */
+  private flush(typed = false): void {
+    const value = this.textarea.value;
+    if (value === this.sent) {
+      this.caretToEnd();
+      return;
+    }
+    this.armIdleClear();
+    const consumed = this.sent.split("\n").length - 1;
+    const graphemes = (s: string) => Array.from(this.segmenter.segment(s), (x) => x.segment);
+    const before = graphemes(this.sent.split("\n")[consumed]);
+    const after = graphemes(value.split("\n").slice(consumed).join("\n"));
+    let p = 0;
+    while (p < before.length && p < after.length && before[p] === after[p]) p++;
+    const deleted = before.length - p;
+    const added = after.slice(p);
+    const inserted = added.join("").replace(/\n/g, "\r");
+    const chord =
+      typed && deleted === 0 && added.length === 1
+        ? this.keyChord?.(inserted)
+        : null;
+    if (chord) {
+      // A chord acts on the PTY's line (Ctrl-C drops it, Alt+b moves its
+      // cursor), so the line is no longer what the field holds.
+      this.resetMirror();
+      this.sendDiff(chord);
+      return;
+    }
+    if (deleted > 0 || inserted.length > 0) {
+      this.sendDiff("\x7f".repeat(deleted) + inserted);
+    }
+    this.sent = value;
+    // Bounded buffer: past the cap, forget immediately after transmitting.
+    if (value.length > 4096) this.resetMirror();
+    this.caretToEnd();
+  }
+
+  /**
+   * Keep the caret collapsed at the end of the field, where the PTY's cursor
+   * is, so the next insertion lands there. Chrome's Android IME path leaves
+   * it at 0 after inserting into a zero-size field (Chromium issue
+   * 349994195), and the next key would go in front of everything typed so
+   * far. Engines that already leave it there are not touched.
+   */
+  private caretToEnd(): void {
+    const ta = this.textarea;
+    const end = ta.value.length;
+    if (ta.selectionStart !== end || ta.selectionEnd !== end) ta.setSelectionRange(end, end);
+  }
+
+  /**
+   * Drop the mirror: the field is cleared and its content forgotten. Call
+   * whenever the PTY's line changes from outside this class, or the next
+   * diff sends bytes that double-apply over the new line state.
+   */
+  resetMirror(): void {
+    this.textarea.value = "";
+    this.sent = "";
+    if (this.idleClear !== null) {
+      clearTimeout(this.idleClear);
+      this.idleClear = null;
+    }
+  }
+
+  /**
+   * A long-lived field is a scratch buffer, not a diary: forget it after a
+   * generous idle, and keep it bounded during a continuous burst. Forgetting
+   * only drops separator context and re-send history; the next transmission
+   * is computed from an empty mirror and appends correctly.
+   */
+  private armIdleClear(): void {
+    if (this.idleClear !== null) clearTimeout(this.idleClear);
+    this.idleClear = setTimeout(() => {
+      if (!this.composing) this.resetMirror();
+    }, 30_000);
   }
 
   private handleMouse(
@@ -405,7 +653,7 @@ export class InputHandler {
     const nav = navMap[e.key];
     if (nav) return e.altKey ? "\x1b" + nav : nav;
 
-    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+    if ([...e.key].length === 1 && !e.ctrlKey && !e.metaKey) {
       return e.altKey ? "\x1b" + e.key : e.key;
     }
 

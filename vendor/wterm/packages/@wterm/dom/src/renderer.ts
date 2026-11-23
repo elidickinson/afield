@@ -1,3 +1,4 @@
+// Modified for afield from upstream wterm; see vendor/wterm/README.md.
 import type { CellData, TerminalCore } from "@wterm/core";
 
 const DEFAULT_COLOR = 256;
@@ -243,7 +244,10 @@ export class Renderer {
   private rows = 0;
   private cols = 0;
 
-  private rowEls: HTMLDivElement[] = [];
+  /** The painted grid rows, in order. Public by contract with scroller
+   *  consumers that adjust painted geometry after the paint (see
+   *  `WTermOptions.onAfterPaint`). */
+  rowEls: HTMLDivElement[] = [];
   private prevCursorRow = -1;
   private prevCursorCol = -1;
   private prevContainerBg = "";
